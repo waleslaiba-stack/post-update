@@ -1,16 +1,11 @@
 """
-Facebook Universal Link Accessibility Checker (High Precision 2-Pass Engine).
-Supports:
-- Share redirect links (/share/p/, /share/v/, /share/r/)
-- Direct Profiles (profile.php?id=... and facebook.com/username)
-- Posts, Reels, Videos, Groups, Photos
-- Dual Engine: Desktop Unshorten Check + Mobile HTML Fallback
+Facebook Universal Link Accessibility Checker (Crawler Preview Engine).
+Uses official Facebook external crawler identity to eliminate login redirects
+and strictly validates real post/profile content vs dead/deleted links.
 """
 import re
-import random
 import hashlib
 import logging
-import asyncio
 from typing import Optional, Tuple
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
@@ -19,18 +14,13 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-DESKTOP_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-)
+# Official Facebook Crawler UA: bypasses human login walls and receives pure preview metadata
+FB_CRAWLER_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
 
-MOBILE_UA = (
-    "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36"
-)
-
-DEFINITE_DEAD_MARKERS = [
+# Text explicitly meaning the content is GONE
+DEAD_PHRASES = [
     "this content isn't available right now",
+    "this content is not available",
     "the link you followed may be broken",
     "the page may have been removed",
     "content not found",
@@ -43,8 +33,20 @@ DEFINITE_DEAD_MARKERS = [
     "এই পেজটি উপলভ্য নয়",
     "nội dung này hiện không khả dụng",
     "este contenido no está disponible",
-    "ce contenu n'est pas disponible",
-    "inhalt derzeit nicht verfügbar"
+    "ce contenido no está disponible",
+    "inhalt derzeit nicht verfügbar",
+    "content unavailable",
+]
+
+# Generic text that Facebook shows when a page is dead or blocked
+GENERIC_LOGIN_PHRASES = [
+    "log into facebook",
+    "log in to facebook",
+    "log in",
+    "facebook - log in or sign up",
+    "connect with friends and the world around you",
+    "start sharing and connecting",
+    "facebook",
 ]
 
 @dataclass
@@ -66,22 +68,18 @@ def normalize_facebook_url(raw_url: str) -> str:
     return url
 
 def extract_fb_uid(url: str) -> str:
-    """Extracts identifier from profiles, posts, shares, reels, or queries."""
     clean_url = url.strip()
     parsed = urlparse(clean_url)
     qs = parse_qs(parsed.query)
 
-    # 1. Query parameters
     for param in ("id", "story_fbid", "fbid", "v"):
         if param in qs and qs[param]:
             return str(qs[param][0]).strip()
 
-    # 2. Modern Share links (/share/p/ID, /share/v/ID, /share/r/ID)
     share_match = re.search(r"/share/[pvr]/([a-zA-Z0-9_-]+)", clean_url)
     if share_match:
         return share_match.group(1)
 
-    # 3. Standard paths
     patterns = [
         r"/posts/(pfbid[0-9a-zA-Z]+)",
         r"/posts/([0-9]+)",
@@ -96,7 +94,6 @@ def extract_fb_uid(url: str) -> str:
         if m:
             return m.group(1)
 
-    # 4. Profile / Page Username path
     path_parts = [p for p in parsed.path.strip("/").split("/") if p and p not in ("pages", "profile.php", "share")]
     if path_parts:
         candidate = path_parts[0]
@@ -106,62 +103,66 @@ def extract_fb_uid(url: str) -> str:
     md5 = hashlib.md5(clean_url.encode("utf-8")).hexdigest()
     return f"FB_{md5[:8]}"
 
-# Backward compatibility alias
-extract_universal_fb_id = extract_fb_uid
+def is_generic_or_empty(text: str) -> bool:
+    if not text:
+        return True
+    t_clean = text.lower().strip()
+    for g in GENERIC_LOGIN_PHRASES:
+        if g in t_clean:
+            return True
+    return False
 
-def extract_page_title(soup: BeautifulSoup, html_text: str) -> str:
-    og_title = soup.find("meta", property="og:title")
-    if og_title and og_title.get("content"):
-        t = og_title["content"].strip()
-        if t and t.lower() not in ("facebook", "log in to facebook"):
-            return re.sub(r"\s*\|\s*Facebook$", "", t, flags=re.I).strip()
-
-    title_tag = soup.find("title")
-    if title_tag and title_tag.text:
-        t = title_tag.text.strip()
-        t = re.sub(r"\s*\|\s*Facebook$", "", t, flags=re.I).strip()
-        if t and t.lower() not in ("facebook", "log in to facebook"):
-            return t
-
-    return ""
-
-async def evaluate_html_content(html_text: str, current_url: str) -> Tuple[bool, str, str]:
+def parse_html_response(html_text: str, final_url: str, uid: str) -> Tuple[bool, str, str]:
     lower_html = html_text.lower()
-    curr_url_lower = current_url.lower()
 
-    for marker in DEFINITE_DEAD_MARKERS:
-        if marker in lower_html:
-            return False, f"Dead content signature: '{marker}'", ""
+    # 1. Explicit dead string check in the HTML body
+    for phrase in DEAD_PHRASES:
+        if phrase in lower_html:
+            return False, f"Dead marker: '{phrase}'", f"Removed Content ({uid})"
 
-    if "checkpoint/block" in curr_url_lower or 'id="m_error_page"' in html_text:
-        return False, "Checkpoint/Error page barrier", ""
+    # 2. Redirected to help or checkpoint
+    if "/help/" in final_url.lower() or "checkpoint" in final_url.lower():
+        return False, "Checkpoint/Help redirect", f"Dead Content ({uid})"
 
     soup = BeautifulSoup(html_text, "html.parser")
-    title = extract_page_title(soup, html_text)
 
-    for marker in DEFINITE_DEAD_MARKERS:
-        if marker in title.lower():
-            return False, f"Dead indicator in title: '{title}'", ""
+    # 3. Extract OpenGraph and Title
+    og_title_tag = soup.find("meta", property="og:title")
+    og_title = og_title_tag["content"].strip() if og_title_tag and og_title_tag.get("content") else ""
 
-    og_desc = soup.find("meta", property="og:description")
-    desc = og_desc.get("content", "").strip() if og_desc else ""
+    og_desc_tag = soup.find("meta", property="og:description")
+    og_desc = og_desc_tag["content"].strip() if og_desc_tag and og_desc_tag.get("content") else ""
 
-    if title or desc:
-        final_name = title or (desc[:35] + "...")
-        return True, "Authentic metadata verified", final_name
+    page_title_tag = soup.find("title")
+    page_title = page_title_tag.text.strip() if page_title_tag and page_title_tag.text else ""
 
-    og_url = soup.find("meta", property="og:url")
-    if og_url and og_url.get("content"):
-        u = og_url["content"].strip().lower()
-        if u in ("https://www.facebook.com/", "https://m.facebook.com/"):
-            return False, "Redirected to root home page (Target not found)", ""
+    # Clean Facebook brand suffixes
+    clean_title = re.sub(r"\s*\|\s*Facebook$", "", og_title or page_title, flags=re.I).strip()
+    clean_title = re.sub(r"^Facebook\s*[- :]\s*", "", clean_title, flags=re.I).strip()
 
-    return False, "No valid content structure detected", ""
+    # 4. Check if title explicitly contains dead phrases
+    for phrase in DEAD_PHRASES:
+        if phrase in clean_title.lower():
+            return False, f"Dead notice in title: '{clean_title}'", f"Removed Content ({uid})"
+
+    # 5. Strict Active Validation:
+    # If the title or description is generic Facebook login text, it means Facebook did NOT find the content!
+    has_real_title = not is_generic_or_empty(clean_title)
+    has_real_desc = not is_generic_or_empty(og_desc)
+
+    if has_real_title:
+        return True, "Authentic title verified", clean_title
+
+    if has_real_desc:
+        return True, "Authentic description verified", og_desc[:40] + "..."
+
+    # If neither real title nor real description exists, content is DEAD
+    return False, "No authentic post/profile metadata found", f"Dead Content ({uid})"
 
 async def check_facebook_link(
     url: str,
     session: Optional[aiohttp.ClientSession] = None,
-    timeout_seconds: int = 20,
+    timeout_seconds: int = 15,
     custom_user_agent: Optional[str] = None
 ) -> CheckResult:
     target_url = normalize_facebook_url(url)
@@ -173,119 +174,59 @@ async def check_facebook_link(
         session = aiohttp.ClientSession(timeout=timeout)
         should_close_session = True
 
+    headers = {
+        "User-Agent": FB_CRAWLER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Mode": "navigate",
+    }
+
     try:
-        # PASS 1: Desktop Engine
-        desktop_headers = {
-            "User-Agent": custom_user_agent or DESKTOP_UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Sec-Fetch-Mode": "navigate",
-            "Upgrade-Insecure-Requests": "1",
-        }
+        async with session.get(
+            target_url,
+            headers=headers,
+            allow_redirects=True,
+            ssl=False
+        ) as resp:
+            status_code = resp.status
+            final_url = str(resp.url)
 
-        try:
-            async with session.get(
-                target_url,
-                headers=desktop_headers,
-                allow_redirects=True,
-                ssl=False
-            ) as resp:
-                status_code = resp.status
-                final_url = str(resp.url)
+            # 404 / 410 is definitely DEAD
+            if status_code in (404, 410):
+                return CheckResult(
+                    is_alive=False,
+                    status="DEAD",
+                    reason=f"HTTP Status {status_code}",
+                    title=f"Deleted Content ({uid})",
+                    uid=uid,
+                    url=target_url,
+                    status_code=status_code,
+                )
 
-                if status_code in (404, 410):
-                    return CheckResult(
-                        is_alive=False,
-                        status="DEAD",
-                        reason=f"HTTP Status {status_code}",
-                        title=f"Deleted Content ({uid})",
-                        uid=uid,
-                        url=target_url,
-                        status_code=status_code
-                    )
+            html_text = await resp.text(errors="ignore")
+            is_alive, reason, title = parse_html_response(html_text, final_url, uid)
 
-                html_text = await resp.text(errors="ignore")
-                is_alive, reason, title = await evaluate_html_content(html_text, final_url)
-
-                if is_alive:
-                    return CheckResult(
-                        is_alive=True,
-                        status="ACTIVE",
-                        reason="Verified via Desktop Engine",
-                        title=title or f"Facebook ({uid})",
-                        uid=uid,
-                        url=target_url,
-                        status_code=status_code
-                    )
-        except Exception as e:
-            logger.warning(f"Pass 1 Desktop check encountered issue: {e}")
-
-        # PASS 2: Mobile Engine
-        mobile_target = re.sub(r"^(https?://)(?:www\.|web\.)facebook\.com", r"\1m.facebook.com", target_url)
-        mobile_headers = {
-            "User-Agent": MOBILE_UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
-            "Upgrade-Insecure-Requests": "1",
-        }
-
-        try:
-            async with session.get(
-                mobile_target,
-                headers=mobile_headers,
-                allow_redirects=True,
-                ssl=False
-            ) as resp:
-                status_code = resp.status
-                final_url = str(resp.url)
-
-                if status_code in (404, 410):
-                    return CheckResult(
-                        is_alive=False,
-                        status="DEAD",
-                        reason=f"HTTP Status {status_code}",
-                        title=f"Deleted Content ({uid})",
-                        uid=uid,
-                        url=target_url,
-                        status_code=status_code
-                    )
-
-                html_text = await resp.text(errors="ignore")
-                is_alive, reason, title = await evaluate_html_content(html_text, final_url)
-
-                if is_alive:
-                    return CheckResult(
-                        is_alive=True,
-                        status="ACTIVE",
-                        reason="Verified via Mobile Engine",
-                        title=title or f"Facebook ({uid})",
-                        uid=uid,
-                        url=target_url,
-                        status_code=status_code
-                    )
-                else:
-                    return CheckResult(
-                        is_alive=False,
-                        status="DEAD",
-                        reason=reason or "Content removed or inaccessible",
-                        title=f"Dead Content ({uid})",
-                        uid=uid,
-                        url=target_url,
-                        status_code=status_code
-                    )
-
-        except Exception as e:
-            logger.warning(f"Pass 2 Mobile check failed: {e}")
             return CheckResult(
-                is_alive=False,
-                status="DEAD",
-                reason="Unreachable link or network error",
-                title=f"Dead Content ({uid})",
+                is_alive=is_alive,
+                status="ACTIVE" if is_alive else "DEAD",
+                reason=reason,
+                title=title,
                 uid=uid,
                 url=target_url,
-                status_code=0
+                status_code=status_code,
             )
 
+    except Exception as e:
+        logger.warning(f"Error checking link {target_url}: {e}")
+        return CheckResult(
+            is_alive=False,
+            status="DEAD",
+            reason=f"Connection failure: {type(e).__name__}",
+            title=f"Dead Link ({uid})",
+            uid=uid,
+            url=target_url,
+            status_code=0,
+        )
     finally:
         if should_close_session:
             await session.close()

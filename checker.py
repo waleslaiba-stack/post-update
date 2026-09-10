@@ -1,7 +1,7 @@
 """
-Facebook Universal Link Health Engine.
-Accurately supports Group Posts, Profiles (ID/Username), and Share Redirects.
-Guarantees network glitches and server dropouts NEVER trigger DEAD alerts.
+Facebook Universal Link Health Engine (Strict Positive-Validation).
+Eliminates the 'All Active' bug by requiring authentic metadata (og:title, og:desc, or App Links).
+Dead/deleted posts that return blank or login-only shells are strictly marked as DEAD.
 """
 import re
 import hashlib
@@ -14,14 +14,16 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# Android Chrome produces plain HTML without desktop checkpoint redirect loops
-MOBILE_CRAWLER_UA = (
+# Android mobile user-agent gives cleaner OpenGraph metadata without complex scripts
+CRAWLER_USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
 )
 
+# Text phrases explicitly rendered when content is removed or link broken
 DEFINITE_DEAD_MARKERS = [
     "this content isn't available right now",
+    "this content is not available",
     "the link you followed may be broken",
     "the page may have been removed",
     "content not found",
@@ -39,13 +41,16 @@ DEFINITE_DEAD_MARKERS = [
     "inhalt derzeit nicht verfügbar",
 ]
 
-GENERIC_TITLES = [
+# Generic text shown ONLY when Facebook blocks or when content does NOT exist
+GENERIC_LOGIN_TITLES = [
     "facebook",
     "log into facebook",
     "log in to facebook",
     "log in",
+    "facebook – log in or sign up",
     "facebook - log in or sign up",
     "error",
+    "",
 ]
 
 @dataclass
@@ -65,7 +70,7 @@ def normalize_facebook_url(raw_url: str) -> str:
     elif url.startswith("http://"):
         url = "https://" + url[7:]
 
-    # Transform to mobile endpoint for consistent parsing across Groups, Profiles, and Shares
+    # Switch to mobile endpoint which serves cleaner meta-tags
     url = re.sub(r"^(https?://)(?:www\.|web\.|mbasic\.)?facebook\.com", r"\1m.facebook.com", url)
     return url
 
@@ -110,49 +115,56 @@ def parse_html_content(html_text: str, current_url: str, uid: str) -> Tuple[bool
     lower_html = html_text.lower()
     curr_url_lower = current_url.lower()
 
-    # 1. Unambiguous proof of permanent deletion
+    # 1. Check for explicit dead phrases in HTML body
     for marker in DEFINITE_DEAD_MARKERS:
         if marker in lower_html:
             return False, f"Dead content signature: '{marker}'", f"Dead Content ({uid})"
 
-    if "checkpoint/block" in curr_url_lower or 'id="m_error_page"' in html_text:
-        return False, "Error page / Block container detected", f"Dead Content ({uid})"
+    # 2. Check for checkpoint or account suspension
+    if "checkpoint/block" in curr_url_lower or 'id="m_error_page"' in html_text or "/help/contact/" in curr_url_lower:
+        return False, "Checkpoint/Security barrier (Link inaccessible)", f"Dead Content ({uid})"
 
     soup = BeautifulSoup(html_text, "html.parser")
 
+    # 3. Extract OpenGraph and Title
     og_title_tag = soup.find("meta", property="og:title")
     og_title = og_title_tag["content"].strip() if og_title_tag and og_title_tag.get("content") else ""
 
     page_title_tag = soup.find("title")
     page_title = page_title_tag.text.strip() if page_title_tag and page_title_tag.text else ""
 
-    clean_title = re.sub(r"\s*\|\s*Facebook$", "", og_title or page_title, flags=re.I).strip()
+    clean_title = og_title or page_title
+    clean_title = re.sub(r"\s*\|\s*Facebook$", "", clean_title, flags=re.I).strip()
     clean_title = re.sub(r"^Facebook\s*[- :]\s*", "", clean_title, flags=re.I).strip()
 
-    # Check title explicitly for dead text
+    # If title itself has removal words
     for marker in DEFINITE_DEAD_MARKERS:
         if marker in clean_title.lower():
-            return False, f"Dead notice in title: '{clean_title}'", f"Dead Content ({uid})"
+            return False, f"Title indicates removal: '{clean_title}'", f"Dead Content ({uid})"
 
-    # If title exists and is not generic Facebook login prompt
-    if clean_title and clean_title.lower() not in GENERIC_TITLES:
-        return True, "Authentic title verified", clean_title
-
-    # Profile / Group / Post description inspection
     og_desc_tag = soup.find("meta", property="og:description")
     og_desc = og_desc_tag["content"].strip() if og_desc_tag and og_desc_tag.get("content") else ""
-    if og_desc and og_desc.lower() not in GENERIC_TITLES:
+
+    # Check AppLink tags (Active Facebook posts/profiles always link to mobile intent)
+    app_link = soup.find("meta", property="al:android:url") or soup.find("meta", property="al:ios:url")
+
+    # STRICT POSITIVE VALIDATION:
+    # Does this page actually have real content?
+    has_authentic_title = bool(clean_title and clean_title.lower() not in GENERIC_LOGIN_TITLES)
+    has_authentic_desc = bool(og_desc and og_desc.lower() not in GENERIC_LOGIN_TITLES)
+    has_valid_app_link = bool(app_link and app_link.get("content"))
+
+    if has_authentic_title:
+        return True, "Authentic title verified", clean_title
+
+    if has_authentic_desc:
         return True, "Authentic description verified", og_desc[:35] + "..."
 
-    # If redirected to generic root without destination
-    og_url_tag = soup.find("meta", property="og:url")
-    if og_url_tag and og_url_tag.get("content"):
-        u = og_url_tag["content"].strip().lower()
-        if u in ("https://www.facebook.com/", "https://m.facebook.com/"):
-            return False, "Redirected to root home page (Target does not exist)", f"Dead Content ({uid})"
+    if has_valid_app_link:
+        return True, "App link target verified", f"Facebook Content ({uid})"
 
-    # Safety: Default to True to prevent server dropouts from killing live links
-    return True, "Content accessible (No deletion signature found)", f"Facebook ({uid})"
+    # If it is just a generic Facebook shell with no actual content, it is DEAD!
+    return False, "No authentic post/profile data found (Content deleted)", f"Dead Content ({uid})"
 
 async def check_facebook_link(
     url: str,
@@ -171,7 +183,7 @@ async def check_facebook_link(
         should_close_session = True
 
     headers = {
-        "User-Agent": custom_user_agent or MOBILE_CRAWLER_UA,
+        "User-Agent": custom_user_agent or CRAWLER_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
         "Sec-Fetch-Mode": "navigate",
@@ -193,7 +205,7 @@ async def check_facebook_link(
                 return CheckResult(
                     is_alive=False,
                     status="DEAD",
-                    reason=f"HTTP Status {status_code} (Content Removed)",
+                    reason=f"HTTP Status {status_code} (Not Found)",
                     title=f"Deleted Content ({uid})",
                     uid=uid,
                     url=target_url,
@@ -214,12 +226,12 @@ async def check_facebook_link(
             )
 
     except Exception as e:
-        logger.warning(f"Network dropout / timeout on {target_url}: {e}")
-        # Retain ACTIVE on network failure or rate limit
+        logger.warning(f"Error checking {target_url}: {e}")
+        # When connection drops out completely, keep status alive to prevent false alerts
         return CheckResult(
             is_alive=True,
             status="ACTIVE",
-            reason="Server hesitation/network delay (Preserved ACTIVE)",
+            reason="Temporary connection delay (Preserved ACTIVE)",
             title=f"Facebook ({uid})",
             uid=uid,
             url=target_url,

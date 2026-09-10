@@ -290,8 +290,6 @@ async def _add_and_report(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         return
 
     if result.status == graph_checker.STATUS_UNKNOWN:
-        # Still save it as ACTIVE so the background worker keeps retrying -
-        # a single transient failure shouldn't block adding a link.
         result_status = "ACTIVE"
         name = object_id
     elif result.status == graph_checker.STATUS_DEAD:
@@ -376,7 +374,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     tg_user = update.effective_user
     user = await db.get_user(tg_user.id)
 
-    # Admin-only actions work even if the admin's own status lookup is odd.
     if data.startswith("admin_approve:") or data.startswith("admin_reject:"):
         if tg_user.id != config.ADMIN_ID:
             return
@@ -427,7 +424,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(f"✅ Timezone set to {h(tzname)}.", reply_markup=main_menu_keyboard())
         return
 
-    # Everything below operates on a specific object id
     if ":" not in data:
         return
     action, obj_id_str = data.split(":", 1)
@@ -512,13 +508,12 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
 
             if result.is_auth_error:
-                # Don't touch the object's status - alert the admin once and move on.
                 logger.warning("Auth error checking object %s: %s", obj.id, result.detail)
                 continue
 
             if result.status == graph_checker.STATUS_UNKNOWN:
                 await db.touch_last_checked(obj.id)
-                continue  # transient - keep ACTIVE, no alert (anti-glitch protection)
+                continue
 
             if result.status == graph_checker.STATUS_ACTIVE:
                 if result.name and result.name != obj.name:
@@ -527,7 +522,6 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     await db.touch_last_checked(obj.id)
                 continue
 
-            # result.status == DEAD
             await db.update_object_status(obj.id, "DEAD", name=result.name or obj.name)
             if not obj.die_alert_sent:
                 await db.set_die_alert_sent(obj.id, True)
@@ -550,8 +544,8 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    asyncio.run(db.init_db())
+async def main() -> None:
+    await db.init_db()
 
     application = Application.builder().token(config.BOT_TOKEN).build()
 
@@ -567,15 +561,18 @@ def main() -> None:
     )
 
     logger.info("Bot starting (check interval: %ss)", config.CHECK_INTERVAL_SECONDS)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
+    async with application:
+        await application.start()
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        
+        # Keep running until killed
+        stop_signal = asyncio.Event()
+        await stop_signal.wait()
 
-import asyncio
 
 if __name__ == '__main__':
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-    
-    main()
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped.")

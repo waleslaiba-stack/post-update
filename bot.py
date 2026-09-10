@@ -1,3 +1,6 @@
+"""
+Facebook Post Monitor Telegram Bot (Production Ready - Bangladesh Timezone & Spoiler Support)
+"""
 import os
 import re
 import html

@@ -1,6 +1,6 @@
 """
 Facebook Link Accessibility Checker.
-Asynchronously checks if Facebook posts/links are alive or have died (removed, deleted, inaccessible).
+Inspects HTTP headers, redirects, HTML keyword signatures, and UID.
 """
 import re
 import random

@@ -4,3 +4,4 @@ aiosqlite>=0.20.0
 beautifulsoup4>=4.12.3
 python-dotenv>=1.0.1
 certifi>=2024.2.2
+pytz>=2024.1

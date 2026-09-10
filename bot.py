@@ -1,5 +1,7 @@
 """
-Facebook Post Monitor Telegram Bot (Production Ready with Proxy Integration)
+Facebook Post Monitor Telegram Bot (Production Ready)
+- Button text changed to 'Continue' and 'Stop'
+- Safe background inspection ensuring server drops do not trigger DEAD alerts
 """
 import os
 import re
@@ -220,14 +222,15 @@ async def build_dead_message(link_data: dict, chat_id: int, is_hidden: bool = Fa
     )
 
     link_id = link_data.get("id")
+    # Updated: Clean buttons with just Continue and Stop
     keyboard = [
         [
             InlineKeyboardButton("🙈 Hide Info", callback_data=f"hide_{link_id}"),
             InlineKeyboardButton("🐵 Show Info", callback_data=f"show_{link_id}"),
         ],
         [
-            InlineKeyboardButton("🟢 Continue Monitoring", callback_data=f"continue_{link_id}"),
-            InlineKeyboardButton("🔴 Stop Monitoring", callback_data=f"stop_{link_id}"),
+            InlineKeyboardButton("🟢 Continue", callback_data=f"continue_{link_id}"),
+            InlineKeyboardButton("🔴 Stop", callback_data=f"stop_{link_id}"),
         ],
     ]
     return text, InlineKeyboardMarkup(keyboard)
@@ -245,15 +248,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         f"🚀 Welcome, <b>{html.escape(user.first_name)}</b>!\n\n"
         f"🔍 <b>Facebook Post & Link DIE Monitor</b>\n"
-        f"Equipped with Proxy Bypass Engine. I monitor your links and alert you instantly "
-        f"the moment a Facebook link is deleted or dies.\n\n"
+        f"I asynchronously track Facebook posts, groups, profiles, and share links. "
+        f"Alerts are only triggered when links genuinely die.\n\n"
         f"📊 <b>Dashboard:</b>\n"
         f"• Total Links: <b>{stats['total']}</b>\n"
         f"• Active: <b>{stats['active']}</b>\n"
         f"• Dead: <b>{stats['dead']}</b>\n"
         f"• Stopped: <b>{stats['stopped']}</b>\n"
         f"• Timezone: <code>{user_tz}</code>\n\n"
-        f"Send any Facebook link to monitor:\n\n"
+        f"Send any Facebook link directly to start monitoring:\n\n"
         f"👑 <b>Owner:</b> <a href=\"https://t.me/tmmusa73\">—͞Tᴍ Mᴜsᴀ ⚡</a>"
     )
     keyboard = [
@@ -284,7 +287,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_states[user.id] = "AWAITING_LINKS"
     text = (
         "➕ <b>Add Links to Monitor</b>\n\n"
-        "Send Facebook link(s) in your message (separated by line breaks or spaces).\n"
+        "Send Facebook link(s) (Profiles, Posts, Groups, Shares) in your message.\n"
         "Send /cancel to abort."
     )
     keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cmd_cancel")]]
@@ -402,7 +405,6 @@ async def cmd_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     stats = await db.get_stats(chat_id)
     _, tz_str = await get_user_now(chat_id)
-
     proxy_status = "🟢 Active" if PROXY_URL else "⚪ Direct"
 
     text = (
@@ -542,7 +544,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
             if record:
-                if not check_result.is_alive:
+                if not check_result.is_alive and check_result.status == "DEAD":
                     await db.update_status(record["id"], status="DEAD", die_alert_sent=1)
                     updated_record = await db.get_link_by_id(record["id"])
                     dead_text, dead_markup = await build_dead_message(updated_record, chat_id, is_hidden=False)
@@ -886,7 +888,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         if link:
             keyboard = [
                 [
-                    InlineKeyboardButton("🟢 Resume Monitoring", callback_data=f"continue_{link_id}"),
+                    InlineKeyboardButton("🟢 Continue", callback_data=f"continue_{link_id}"),
                     InlineKeyboardButton("🗑️ Remove Permanently", callback_data=f"remove_{link_id}"),
                 ],
                 [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
@@ -937,8 +939,9 @@ async def run_single_monitoring_cycle(app: Application, target_chat_id: Optional
                 result = await check_facebook_link(url, session=session, proxy_url=PROXY_URL)
                 await db.update_last_checked(link_id)
 
+                # Send alert strictly when DEAD is confirmed
                 if not result.is_alive and result.status == "DEAD":
-                    logger.warning(f"Link {url} confirmed DEAD via Proxy Engine!")
+                    logger.warning(f"Link {url} confirmed DEAD!")
                     await db.update_status(link_id, status="DEAD", die_alert_sent=1)
                     updated_link = await db.get_link_by_id(link_id)
 
@@ -952,7 +955,7 @@ async def run_single_monitoring_cycle(app: Application, target_chat_id: Optional
                                 parse_mode=ParseMode.HTML,
                                 disable_web_page_preview=True,
                             )
-                            logger.info(f"DEAD alert dispatched to {chat_id}")
+                            logger.info(f"DEAD alert sent to {chat_id}")
                         except Exception as e:
                             logger.error(f"Failed to send alert to {chat_id}: {e}")
 
@@ -1014,7 +1017,7 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
 
-    logger.info("Bot started with Proxy Engine...")
+    logger.info("Bot started successfully...")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":

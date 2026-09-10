@@ -3,8 +3,9 @@ import re
 import html
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional, Tuple
+import pytz
 import aiohttp
 from dotenv import load_dotenv
 from telegram import (
@@ -33,6 +34,15 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("FBMonitorBot")
+
+# Timezone set to Bangladesh Standard Time (BST)
+BD_TZ = pytz.timezone("Asia/Dhaka")
+
+def get_bd_now() -> datetime:
+    return datetime.now(BD_TZ)
+
+def get_bd_now_str() -> str:
+    return get_bd_now().strftime("%d-%m-%Y %H:%M:%S")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
@@ -65,8 +75,7 @@ def is_user_allowed(user_id: int) -> bool:
 
 def format_processing_time(created_str: str, updated_str: str) -> str:
     formats = ["%d-%m-%Y %H:%M:%S", "%H:%M:%S %d-%m-%Y"]
-    t1 = None
-    t2 = None
+    t1, t2 = None, None
     for fmt in formats:
         try:
             t1 = datetime.strptime(created_str, fmt)
@@ -81,9 +90,9 @@ def format_processing_time(created_str: str, updated_str: str) -> str:
             continue
 
     if not t1:
-        t1 = datetime.now() - timedelta(minutes=5)
+        t1 = get_bd_now().replace(tzinfo=None)
     if not t2:
-        t2 = datetime.now()
+        t2 = get_bd_now().replace(tzinfo=None)
 
     diff = t2 - t1
     total_seconds = max(int(diff.total_seconds()), 0)
@@ -108,7 +117,7 @@ def build_active_message(link_data: dict) -> Tuple[str, InlineKeyboardMarkup]:
         dt = datetime.strptime(created_raw, "%d-%m-%Y %H:%M:%S")
         created_formatted = dt.strftime("%H:%M:%S %d-%m-%Y")
     except Exception:
-        created_formatted = created_raw or datetime.now().strftime("%H:%M:%S %d-%m-%Y")
+        created_formatted = created_raw or get_bd_now().strftime("%H:%M:%S %d-%m-%Y")
 
     text = (
         f"🔔 UID: {uid} - <a href=\"{html.escape(url)}\">Link Facebook</a>\n"
@@ -134,24 +143,29 @@ def build_dead_message(link_data: dict, is_hidden: bool = False) -> Tuple[str, I
     raw_name = str(link_data.get("name", "Facebook Post"))
     raw_note = str(link_data.get("note", "None") or "None")
 
-    uid = "**********" if is_hidden else html.escape(raw_uid)
-    name = "**********" if is_hidden else html.escape(raw_name)
-    note = "**********" if is_hidden else html.escape(raw_note)
+    if is_hidden:
+        uid = f"<tg-spoiler>{html.escape(raw_uid)}</tg-spoiler>"
+        name = f"<tg-spoiler>{html.escape(raw_name)}</tg-spoiler>"
+        note = f"<tg-spoiler>{html.escape(raw_note)}</tg-spoiler>"
+    else:
+        uid = html.escape(raw_uid)
+        name = html.escape(raw_name)
+        note = html.escape(raw_note)
 
     created_raw = link_data.get("created_at", "")
-    updated_raw = link_data.get("updated_at", "") or datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    updated_raw = link_data.get("updated_at", "") or get_bd_now_str()
 
     try:
         dt1 = datetime.strptime(created_raw, "%d-%m-%Y %H:%M:%S")
         created_str = dt1.strftime("%d-%m-%Y %H:%M:%S")
     except Exception:
-        created_str = created_raw or datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+        created_str = created_raw or get_bd_now_str()
 
     try:
         dt2 = datetime.strptime(updated_raw, "%d-%m-%Y %H:%M:%S")
         updated_str = dt2.strftime("%d-%m-%Y %H:%M:%S")
     except Exception:
-        updated_str = updated_raw or datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+        updated_str = updated_raw or get_bd_now_str()
 
     processing_time = format_processing_time(created_str, updated_str)
 
@@ -196,7 +210,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• Dead: <b>{stats['dead']}</b>\n"
         f"• Stopped: <b>{stats['stopped']}</b>\n\n"
         f"Send or paste any Facebook link directly to start monitoring, "
-        f"or use the quick actions below:"
+        f"or use the quick actions below:\n\n"
+        f"👑 <b>Owner:</b> <a href=\"https://t.me/tmmusa73\">—͞Tᴍ Mᴜsᴀ ⚡</a>"
     )
     keyboard = [
         [
@@ -212,6 +227,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -421,7 +437,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         del user_states[user.id]
 
     status_msg = await update.message.reply_text(
-        f"⏳ Found {len(raw_urls)} Facebook link(s). Resolving details and initiating monitoring..."
+        f"⏳ Found {len(raw_urls)} Facebook link(s). Checking status..."
     )
 
     async with aiohttp.ClientSession() as session:
@@ -436,6 +452,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 session=session,
                 custom_user_agent=USER_AGENT,
             )
+
+            # Store in database
             record = await db.add_link(
                 chat_id=chat_id,
                 uid=uid,
@@ -443,14 +461,28 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 name=check_result.title,
                 note="None",
             )
+
             if record:
-                msg_text, reply_markup = build_active_message(record)
-                await update.message.reply_text(
-                    msg_text,
-                    reply_markup=reply_markup,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
+                # If already DEAD, alert directly as DEAD
+                if not check_result.is_alive or check_result.status == "DEAD":
+                    await db.update_status(record["id"], status="DEAD", die_alert_sent=1)
+                    updated_record = await db.get_link_by_id(record["id"])
+                    dead_text, dead_markup = build_dead_message(updated_record, is_hidden=False)
+                    await update.message.reply_text(
+                        dead_text,
+                        reply_markup=dead_markup,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    msg_text, reply_markup = build_active_message(record)
+                    await update.message.reply_text(
+                        msg_text,
+                        reply_markup=reply_markup,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+
             if len(raw_urls) > 1:
                 await asyncio.sleep(1.0)
 
@@ -479,7 +511,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"• Active: <b>{stats['active']}</b>\n"
             f"• Dead: <b>{stats['dead']}</b>\n"
             f"• Stopped: <b>{stats['stopped']}</b>\n\n"
-            f"Choose an action below:"
+            f"Choose an action below:\n\n"
+            f"👑 <b>Owner:</b> <a href=\"https://t.me/tmmusa73\">—͞Tᴍ Mᴜsᴀ ⚡</a>"
         )
         keyboard = [
             [
@@ -491,7 +524,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             ],
         ]
         await query.edit_message_text(
-            text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML
+            text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML, disable_web_page_preview=True
         )
         return
 

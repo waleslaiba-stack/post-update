@@ -1,26 +1,22 @@
 """
-Facebook Universal Link Accessibility Checker (High-Stability Engine).
-Features:
-- Dual-Pass Inspection: Proxy Primary + Direct Fail-safe
-- Accurate for Groups, Profiles, Posts, Reels, and Share Redirects
-- Zero Hanging / Instant Status Feedback
+Facebook Universal Link Accessibility Checker via Real Headless Browser (Playwright).
+Renders full JavaScript, bypasses bot walls, and inspects real DOM content.
 """
-import os
 import re
 import hashlib
 import logging
+import asyncio
 from typing import Optional, Tuple
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
-import aiohttp
-from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, Browser, BrowserContext
 
 logger = logging.getLogger(__name__)
 
-# Standard Real-Device User-Agent to avoid scraping traps
-REAL_DEVICE_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+# Real Android Mobile view gives zero-friction rendering on Facebook
+MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36"
 )
 
 DEFINITE_DEAD_MARKERS = [
@@ -43,15 +39,13 @@ DEFINITE_DEAD_MARKERS = [
     "inhalt derzeit nicht verfügbar",
 ]
 
-GENERIC_TRASH = [
+GENERIC_LOGINS = [
     "facebook",
     "log into facebook",
     "log in to facebook",
     "log in",
     "facebook - log in or sign up",
-    "facebook – log in or sign up",
     "error",
-    "",
 ]
 
 @dataclass
@@ -64,12 +58,37 @@ class CheckResult:
     url: str
     status_code: int = 200
 
+# Global headless browser instance to save memory & startup time
+_playwright_instance = None
+_browser_instance: Optional[Browser] = None
+_browser_lock = asyncio.Lock()
+
+async def get_browser() -> Browser:
+    global _playwright_instance, _browser_instance
+    async with _browser_lock:
+        if _browser_instance is None or not _browser_instance.is_connected():
+            _playwright_instance = await async_playwright().start()
+            _browser_instance = await _playwright_instance.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--single-process",
+                ]
+            )
+        return _browser_instance
+
 def normalize_facebook_url(raw_url: str) -> str:
     url = raw_url.strip().rstrip(",.;!$*")
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     elif url.startswith("http://"):
         url = "https://" + url[7:]
+
+    # Transform to mobile endpoint for lighter, cleaner rendering
+    url = re.sub(r"^(https?://)(?:www\.|web\.|mbasic\.)?facebook\.com", r"\1m.facebook.com", url)
     return url
 
 def extract_fb_uid(url: str) -> str:
@@ -109,105 +128,40 @@ def extract_fb_uid(url: str) -> str:
     md5 = hashlib.md5(clean_url.encode("utf-8")).hexdigest()
     return f"FB_{md5[:8]}"
 
-def inspect_html_health(html_text: str, final_url: str, uid: str) -> Tuple[bool, str, str]:
-    lower_html = html_text.lower()
-    curr_url_lower = final_url.lower()
-
-    # Explicit dead signatures
-    for marker in DEFINITE_DEAD_MARKERS:
-        if marker in lower_html:
-            return False, f"Dead content signature: '{marker}'", f"Dead Content ({uid})"
-
-    # Checkpoint / Barrier detection
-    if "checkpoint/block" in curr_url_lower or "/help/contact/" in curr_url_lower:
-        return False, "Checkpoint/Help barrier redirect", f"Dead Content ({uid})"
-
-    soup = BeautifulSoup(html_text, "html.parser")
-
-    og_title_tag = soup.find("meta", property="og:title")
-    og_title = og_title_tag["content"].strip() if og_title_tag and og_title_tag.get("content") else ""
-
-    page_title_tag = soup.find("title")
-    page_title = page_title_tag.text.strip() if page_title_tag and page_title_tag.text else ""
-
-    clean_title = og_title or page_title
-    clean_title = re.sub(r"\s*\|\s*Facebook$", "", clean_title, flags=re.I).strip()
-    clean_title = re.sub(r"^Facebook\s*[- :]\s*", "", clean_title, flags=re.I).strip()
-
-    for marker in DEFINITE_DEAD_MARKERS:
-        if marker in clean_title.lower():
-            return False, f"Title indicates removal: '{clean_title}'", f"Dead Content ({uid})"
-
-    og_desc_tag = soup.find("meta", property="og:description")
-    og_desc = og_desc_tag["content"].strip() if og_desc_tag and og_desc_tag.get("content") else ""
-
-    # Canonical redirect to root domain means content was deleted
-    og_url_tag = soup.find("meta", property="og:url")
-    if og_url_tag and og_url_tag.get("content"):
-        u = og_url_tag["content"].strip().lower()
-        if u in ("https://www.facebook.com/", "https://www.facebook.com", "https://m.facebook.com/"):
-            return False, "Redirected to root home page (Target does not exist)", f"Dead Content ({uid})"
-
-    has_real_title = bool(clean_title and clean_title.lower() not in GENERIC_TRASH)
-    has_real_desc = bool(og_desc and og_desc.lower() not in GENERIC_TRASH)
-
-    if has_real_title:
-        return True, "Authentic title verified", clean_title
-
-    if has_real_desc:
-        return True, "Authentic description verified", og_desc[:35] + "..."
-
-    # If only login text is returned and no target details exist, the post is DEAD
-    if any(b in curr_url_lower for b in ["/login", "login.php"]):
-        return False, "Redirected to login with no post context (Content removed)", f"Dead Content ({uid})"
-
-    return False, "No authentic post or profile metadata found (Content removed)", f"Dead Content ({uid})"
-
-async def _fetch_request(url: str, session: aiohttp.ClientSession, proxy: Optional[str] = None) -> Tuple[int, str, str]:
-    headers = {
-        "User-Agent": REAL_DEVICE_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
-        "Sec-Fetch-Mode": "navigate",
-        "Upgrade-Insecure-Requests": "1",
-    }
-    async with session.get(
-        url,
-        headers=headers,
-        proxy=proxy,
-        allow_redirects=True,
-        timeout=aiohttp.ClientTimeout(total=12),
-        ssl=False
-    ) as resp:
-        html = await resp.text(errors="ignore")
-        return resp.status, str(resp.url), html
-
 async def check_facebook_link(
     url: str,
-    session: Optional[aiohttp.ClientSession] = None,
+    session: Optional[any] = None,
     proxy_url: Optional[str] = None,
-    timeout_seconds: int = 15,
+    timeout_seconds: int = 25,
     custom_user_agent: Optional[str] = None
 ) -> CheckResult:
     target_url = normalize_facebook_url(url)
     uid = extract_fb_uid(target_url)
-    should_close_session = False
 
-    if session is None:
-        session = aiohttp.ClientSession()
-        should_close_session = True
-
-    proxy = proxy_url or os.getenv("PROXY_URL", "").strip() or None
-
+    context: Optional[BrowserContext] = None
     try:
-        # Pass 1: Try with configured Proxy
-        try:
-            status_code, final_url, html_text = await _fetch_request(target_url, session, proxy=proxy)
-        except Exception as proxy_err:
-            logger.warning(f"Proxy attempt failed on {target_url}, falling back to Direct: {proxy_err}")
-            # Pass 2: Direct fallback if proxy has issues
-            status_code, final_url, html_text = await _fetch_request(target_url, session, proxy=None)
+        browser = await get_browser()
+        context = await browser.new_context(
+            user_agent=custom_user_agent or MOBILE_USER_AGENT,
+            viewport={"width": 412, "height": 915},
+            locale="en-US",
+            java_script_enabled=True,
+        )
 
+        # Route block media to speed up loading and save Railway RAM
+        page = await context.new_page()
+        await page.route(
+            "**/*",
+            lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_()
+        )
+
+        response = await page.goto(target_url, timeout=timeout_seconds * 1000, wait_until="domcontentloaded")
+        await asyncio.sleep(2.0)  # Brief wait for Facebook React DOM hydration
+
+        status_code = response.status if response else 200
+        final_url = page.url.lower()
+
+        # Strict HTTP 404/410
         if status_code in (404, 410):
             return CheckResult(
                 is_alive=False,
@@ -216,33 +170,91 @@ async def check_facebook_link(
                 title=f"Deleted Content ({uid})",
                 uid=uid,
                 url=target_url,
-                status_code=status_code,
+                status_code=status_code
             )
 
-        is_alive, reason, title = inspect_html_health(html_text, final_url, uid)
+        # Evaluate live page text rendered by browser
+        body_text = (await page.inner_text("body")).lower()
+        page_title = await page.title()
+        clean_title = re.sub(r"\s*\|\s*Facebook$", "", page_title, flags=re.I).strip()
+        clean_title = re.sub(r"^Facebook\s*[- :]\s*", "", clean_title, flags=re.I).strip()
 
-        return CheckResult(
-            is_alive=is_alive,
-            status="ACTIVE" if is_alive else "DEAD",
-            reason=reason,
-            title=title or f"Facebook ({uid})",
-            uid=uid,
-            url=target_url,
-            status_code=status_code,
-        )
+        # 1. Direct Dead signature inside browser DOM
+        for marker in DEFINITE_DEAD_MARKERS:
+            if marker in body_text or marker in clean_title.lower():
+                return CheckResult(
+                    is_alive=False,
+                    status="DEAD",
+                    reason=f"Dead signature verified in DOM: '{marker}'",
+                    title=f"Deleted Content ({uid})",
+                    uid=uid,
+                    url=target_url,
+                    status_code=status_code
+                )
 
-    except Exception as e:
-        logger.error(f"Checker error on {target_url}: {e}")
-        # Keep alive on complete network failure to avoid false dead triggers
+        # 2. Check for error page elements or checkpoint
+        error_element = await page.query_selector('#m_error_page, [data-sigil="m_error_page"]')
+        if error_element is not None or "checkpoint/block" in final_url:
+            return CheckResult(
+                is_alive=False,
+                status="DEAD",
+                reason="Facebook error container rendered",
+                title=f"Deleted Content ({uid})",
+                uid=uid,
+                url=target_url,
+                status_code=status_code
+            )
+
+        # 3. Check for genuine OpenGraph tags populated in DOM
+        og_title = await page.evaluate("""() => {
+            const el = document.querySelector('meta[property="og:title"]');
+            return el ? el.content : '';
+        }""")
+        og_desc = await page.evaluate("""() => {
+            const el = document.querySelector('meta[property="og:description"]');
+            return el ? el.content : '';
+        }""")
+
+        display_title = og_title or clean_title
+        display_title = re.sub(r"\s*\|\s*Facebook$", "", display_title, flags=re.I).strip()
+
+        # If redirected to generic login wall without specific target context
+        if (display_title.lower() in GENERIC_LOGINS or not display_title) and (not og_desc or og_desc.lower() in GENERIC_LOGINS):
+            if any(b in final_url for b in ["/login", "login.php", "checkpoint"]):
+                return CheckResult(
+                    is_alive=False,
+                    status="DEAD",
+                    reason="Redirected to blank login without target context (Content removed)",
+                    title=f"Deleted Content ({uid})",
+                    uid=uid,
+                    url=target_url,
+                    status_code=status_code
+                )
+
+        # Content is genuinely ALIVE
+        final_name = display_title if display_title.lower() not in GENERIC_LOGINS else (og_desc[:35] + "...")
         return CheckResult(
             is_alive=True,
             status="ACTIVE",
-            reason="Network delay (Link kept ACTIVE)",
+            reason="Verified active via Chromium DOM render",
+            title=final_name or f"Facebook ({uid})",
+            uid=uid,
+            url=target_url,
+            status_code=status_code
+        )
+
+    except Exception as e:
+        logger.warning(f"Browser check exception on {target_url}: {e}")
+        # Keep alive on browser delay to prevent transient false dead alerts
+        return CheckResult(
+            is_alive=True,
+            status="ACTIVE",
+            reason="Browser render delay (Retained ACTIVE)",
             title=f"Facebook ({uid})",
             uid=uid,
             url=target_url,
-            status_code=0,
+            status_code=0
         )
     finally:
-        if should_close_session:
-            await session.close()
+        if context:
+            await context.close()

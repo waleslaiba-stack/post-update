@@ -1,7 +1,6 @@
 """
-Facebook Link Accessibility Checker (Production Engine via Facebook oEmbed Protocol).
-Eliminates datacenter scraping blocks & false positives.
-Works with raw URLs, missing https/www, and extracts genuine live status.
+Facebook Link Accessibility Checker (Strict Metadata & Anti-Redirect Engine).
+Solves Railway/Cloud False-Active bug by strictly inspecting og:url and content headers.
 """
 import re
 import hashlib
@@ -9,15 +8,33 @@ import logging
 import asyncio
 from typing import Optional, Tuple
 from dataclasses import dataclass
-from urllib.parse import urlparse, parse_qs, quote
+from urllib.parse import urlparse, parse_qs
 import aiohttp
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# Official Facebook Graph & Plugin oEmbed endpoints for unauthenticated status inspection
-OEMBED_ENDPOINTS = [
-    "https://www.facebook.com/plugins/post/oembed.json/?url=",
-    "https://www.facebook.com/plugins/video/oembed.json/?url="
+# Android mobile user agent produces clean, predictable HTML structure
+CRAWLER_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.6099.210 Mobile Safari/537.36"
+)
+
+# Text that Facebook renders when content does not exist
+DEFINITE_DEAD_MARKERS = [
+    "this content isn't available right now",
+    "the link you followed may be broken",
+    "the page may have been removed",
+    "content not found",
+    "page not found",
+    "this page isn't available",
+    "attachment unavailable",
+    "sorry, this content isn't available",
+    "এই কন্টেন্টটি এখন উপলভ্য নয়",
+    "nội dung này hiện không khả dụng",
+    "este contenido no está disponible",
+    "ce contenu n'est pas disponible",
+    "inhalt derzeit nicht verfügbar"
 ]
 
 @dataclass
@@ -32,20 +49,17 @@ class CheckResult:
 
 def normalize_facebook_url(raw_url: str) -> str:
     """
-    Cleans and standardizes raw inputs like 'facebook.com/username' or 'fb.watch/xyz'
-    into a valid HTTPS Facebook URL.
+    Cleans raw user inputs: handles cases like 'facebook.com/username'
+    and removes desktop clutter.
     """
-    url = raw_url.strip()
-    # Strip unnecessary trailing punctuation
-    url = url.rstrip(",.;!$*")
-
+    url = raw_url.strip().rstrip(",.;!$*")
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     elif url.startswith("http://"):
         url = "https://" + url[7:]
 
-    # Normalize mobile/mbasic prefixes to standard www for oEmbed compatibility
-    url = re.sub(r"^(https?://)(?:m\.|mbasic\.|web\.)facebook\.com", r"\1www.facebook.com", url)
+    # Switch to m.facebook.com for predictable parsing
+    url = re.sub(r"^(https?://)(?:www\.|web\.|mbasic\.)?facebook\.com", r"\1m.facebook.com", url)
     return url
 
 def extract_fb_uid(url: str) -> str:
@@ -84,91 +98,63 @@ def extract_fb_uid(url: str) -> str:
     md5 = hashlib.md5(clean_url.encode("utf-8")).hexdigest()
     return f"FB_{md5[:10]}"
 
-async def check_via_oembed(normalized_url: str, session: aiohttp.ClientSession) -> Tuple[Optional[bool], str, str]:
-    """
-    Queries Facebook's native oEmbed API.
-    Returns: (is_alive, reason, author/title)
-    """
-    headers = {
-        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-    }
+def analyze_facebook_html(html_text: str, current_url: str, initial_url: str) -> Tuple[bool, str, str]:
+    uid = extract_fb_uid(initial_url)
+    lower_html = html_text.lower()
+    current_url_lower = current_url.lower()
 
-    encoded_url = quote(normalized_url, safe="")
+    # Rule 1: Immediate Dead Markers in body text
+    for marker in DEFINITE_DEAD_MARKERS:
+        if marker in lower_html:
+            return False, f"Dead content signature detected: '{marker}'", f"Removed Post ({uid})"
 
-    for endpoint in OEMBED_ENDPOINTS:
-        target_api = f"{endpoint}{encoded_url}"
-        try:
-            async with session.get(target_api, headers=headers, timeout=aiohttp.ClientTimeout(total=8), ssl=False) as resp:
-                if resp.status == 200:
-                    try:
-                        data = await resp.json()
-                        author = data.get("author_name") or data.get("title") or "Facebook Post"
-                        return True, "Verified ACTIVE via Facebook oEmbed API", author
-                    except Exception:
-                        return True, "Verified ACTIVE via Facebook oEmbed", "Facebook Post"
-                elif resp.status in (404, 400):
-                    # 404/400 from oEmbed specifically means content does not exist or was deleted
-                    continue
-        except Exception:
-            continue
+    # Rule 2: Redirected to generic Login / Checkpoint without landing on target
+    if "checkpoint" in current_url_lower or "/help/" in current_url_lower:
+        return False, "Redirected to Facebook barrier/help (Link does not exist)", f"Dead Content ({uid})"
 
-    return None, "oEmbed unconfirmed", ""
+    soup = BeautifulSoup(html_text, "html.parser")
 
-async def check_via_http_inspection(normalized_url: str, session: aiohttp.ClientSession) -> Tuple[bool, str, str]:
-    """
-    Fallback HTTP inspection using Facebook External Hit crawler identity.
-    """
-    uid = extract_fb_uid(normalized_url)
-    headers = {
-        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+    # Rule 3: Inspect Page Title
+    page_title = ""
+    og_title_tag = soup.find("meta", property="og:title")
+    if og_title_tag and og_title_tag.get("content"):
+        page_title = og_title_tag["content"].strip()
+    if not page_title:
+        title_tag = soup.find("title")
+        if title_tag and title_tag.text:
+            page_title = title_tag.text.strip()
 
-    try:
-        async with session.get(normalized_url, headers=headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10), ssl=False) as resp:
-            status_code = resp.status
-            final_url = str(resp.url).lower()
+    clean_title = re.sub(r"\s*\|\s*Facebook$", "", page_title, flags=re.I).strip()
+    clean_title = re.sub(r"^Facebook\s*[- :]\s*", "", clean_title, flags=re.I).strip()
 
-            if status_code in (404, 410):
-                return False, f"HTTP {status_code} (Not Found)", f"Dead Content ({uid})"
+    for marker in DEFINITE_DEAD_MARKERS:
+        if marker in clean_title.lower():
+            return False, f"Dead marker in page title: '{clean_title}'", f"Removed Post ({uid})"
 
-            # Genuine Facebook redirection to error or dead-end home
-            if "/help/" in final_url or "checkpoint" in final_url:
-                return False, "Redirected to Facebook Help/Barrier (Deleted)", f"Dead Content ({uid})"
+    # Rule 4: Metadata Authenticity Check
+    # Active Facebook posts have specific OpenGraph tags: og:url, og:description, or canonical link
+    og_url_tag = soup.find("meta", property="og:url")
+    og_url = og_url_tag["content"].strip().lower() if og_url_tag and og_url_tag.get("content") else ""
 
-            html_text = await resp.text(errors="ignore")
-            lower_html = html_text.lower()
+    og_desc_tag = soup.find("meta", property="og:description")
+    og_desc = og_desc_tag["content"].strip() if og_desc_tag and og_desc_tag.get("content") else ""
 
-            dead_signatures = [
-                "this content isn't available right now",
-                "the link you followed may be broken",
-                "content not found",
-                "page not found",
-                "this page isn't available",
-                "attachment unavailable",
-                "এই কন্টেন্টটি এখন উপলভ্য নয়",
-            ]
+    # If redirected to generic Facebook root domain, the link is dead
+    if og_url in ("https://www.facebook.com/", "https://m.facebook.com/", "https://facebook.com/"):
+        return False, "Redirected to home domain (Post no longer exists)", f"Dead Content ({uid})"
 
-            for phrase in dead_signatures:
-                if phrase in lower_html:
-                    return False, f"Dead notice found: '{phrase}'", f"Content Removed ({uid})"
+    # If the title is just a blank login screen without specific post description, it is dead
+    generic_titles = ["log in to facebook", "log into facebook", "facebook", "error", "welcome to facebook"]
+    if clean_title.lower() in generic_titles:
+        if not og_desc or og_desc.lower() in generic_titles:
+            return False, "Login wall with no valid post context (Post deleted or private)", f"Dead Content ({uid})"
 
-            # Check title for dead signs
-            m_title = re.search(r"<title>(.*?)</title>", html_text, re.IGNORECASE)
-            title = m_title.group(1).strip() if m_title else f"Facebook Post ({uid})"
-            title = re.sub(r"\s*\|\s*Facebook$", "", title, flags=re.I).strip()
+    # Rule 5: Error container checks
+    if 'id="m_error_page"' in html_text or 'data-sigil="m_error_page"' in html_text:
+        return False, "Facebook error page container detected", f"Dead Content ({uid})"
 
-            if any(phrase in title.lower() for phrase in dead_signatures):
-                return False, f"Dead notice in title: '{title}'", f"Content Removed ({uid})"
-
-            return True, "Content accessible", title or f"Facebook Post ({uid})"
-
-    except Exception as e:
-        logger.warning(f"Inspection error on {normalized_url}: {e}")
-        # Default to False if connection completely fails
-        return False, "Host unreachable / Broken link", f"Dead Content ({uid})"
+    final_name = clean_title or og_desc[:30] or f"Facebook Post ({uid})"
+    return True, "Valid Facebook content detected", final_name
 
 async def check_facebook_link(
     url: str,
@@ -176,42 +162,69 @@ async def check_facebook_link(
     timeout_seconds: int = 15,
     custom_user_agent: Optional[str] = None
 ) -> CheckResult:
-    normalized_url = normalize_facebook_url(url)
-    uid = extract_fb_uid(normalized_url)
+    target_url = normalize_facebook_url(url)
+    uid = extract_fb_uid(target_url)
     should_close_session = False
 
     if session is None:
-        session = aiohttp.ClientSession()
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        session = aiohttp.ClientSession(timeout=timeout)
         should_close_session = True
 
-    try:
-        # Step 1: Query Facebook oEmbed Endpoint (Most accurate for posts, videos, reels)
-        is_live_oembed, oembed_reason, oembed_title = await check_via_oembed(normalized_url, session)
+    headers = {
+        "User-Agent": custom_user_agent or CRAWLER_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Mode": "navigate",
+        "Upgrade-Insecure-Requests": "1",
+    }
 
-        if is_live_oembed is True:
+    try:
+        async with session.get(
+            target_url,
+            headers=headers,
+            allow_redirects=True,
+            ssl=False
+        ) as resp:
+            status_code = resp.status
+            final_url = str(resp.url)
+
+            # Strict 404 / 410 check
+            if status_code in (404, 410):
+                return CheckResult(
+                    is_alive=False,
+                    status="DEAD",
+                    reason=f"HTTP status code {status_code} (Not Found)",
+                    title=f"Deleted Post ({uid})",
+                    uid=uid,
+                    url=target_url,
+                    status_code=status_code,
+                )
+
+            html_text = await resp.text(errors="ignore")
+            is_alive, reason, title = analyze_facebook_html(html_text, final_url, target_url)
+
             return CheckResult(
-                is_alive=True,
-                status="ACTIVE",
-                reason=oembed_reason,
-                title=oembed_title,
+                is_alive=is_alive,
+                status="ACTIVE" if is_alive else "DEAD",
+                reason=reason,
+                title=title,
                 uid=uid,
-                url=normalized_url,
-                status_code=200,
+                url=target_url,
+                status_code=status_code,
             )
 
-        # Step 2: Fallback to Facebook External Hit HTTP verification
-        is_alive, reason, title = await check_via_http_inspection(normalized_url, session)
-
+    except Exception as e:
+        logger.warning(f"Error checking link {url}: {e}")
         return CheckResult(
-            is_alive=is_alive,
-            status="ACTIVE" if is_alive else "DEAD",
-            reason=reason,
-            title=title,
+            is_alive=False,
+            status="DEAD",
+            reason=f"Connection failure: {type(e).__name__}",
+            title=f"Dead Link ({uid})",
             uid=uid,
-            url=normalized_url,
-            status_code=200 if is_alive else 404,
+            url=target_url,
+            status_code=0,
         )
-
     finally:
         if should_close_session:
             await session.close()

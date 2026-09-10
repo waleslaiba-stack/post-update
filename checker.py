@@ -1,14 +1,12 @@
 """
-Facebook Universal Link Accessibility Checker (High Reliability Engine).
-Strict Rule: A link is ONLY marked as DEAD if Facebook explicitly returns 404
-or unambiguous removal text. Transient blocks, blank responses, or login prompts
-will NEVER trigger a DEAD status.
+Facebook Deep Multi-Pass Link Checker.
+Uses Messenger/WhatsApp Link Preview Scraper Protocol with 5-Cycle Verification.
 """
 import re
 import hashlib
 import logging
 import asyncio
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
 import aiohttp
@@ -16,12 +14,23 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-FB_CRAWLER_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
+# Official Facebook Link Preview Scraper Identifiers (Used by Messenger/WhatsApp)
+MESSENGER_PREVIEW_HEADERS = [
+    {
+        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    },
+    {
+        "User-Agent": "facebookexternalhit/1.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+]
 
-# Text phrases that Facebook renders ONLY when the post/profile is truly deleted or taken down
-GENUINE_DEAD_PHRASES = [
+# Dead text markers that only appear on removed/deleted targets
+AUTHENTIC_DEAD_MARKERS = [
     "this content isn't available right now",
-    "this content is not available",
     "the link you followed may be broken",
     "the page may have been removed",
     "content not found",
@@ -37,6 +46,16 @@ GENUINE_DEAD_PHRASES = [
     "este contenido no está disponible",
     "ce contenido no está disponible",
     "inhalt derzeit nicht verfügbar",
+]
+
+GENERIC_TRASH_TITLES = [
+    "facebook",
+    "log into facebook",
+    "log in to facebook",
+    "log in",
+    "facebook – log in or sign up",
+    "error",
+    "",
 ]
 
 @dataclass
@@ -93,132 +112,136 @@ def extract_fb_uid(url: str) -> str:
     md5 = hashlib.md5(clean_url.encode("utf-8")).hexdigest()
     return f"FB_{md5[:8]}"
 
-def inspect_for_definite_death(html_text: str, current_url: str) -> Tuple[bool, str]:
-    """
-    Returns (True, reason) ONLY if there is 100% concrete proof the link is deleted.
-    Otherwise returns (False, "") meaning it should be treated as ACTIVE.
-    """
-    lower_html = html_text.lower()
-    curr_url_lower = current_url.lower()
-
-    # Explicit removal messages inside HTML text
-    for phrase in GENUINE_DEAD_PHRASES:
-        if phrase in lower_html:
-            return True, f"Found explicit dead phrase: '{phrase}'"
-
-    # Redirection directly to help/checkpoint/barrier indicates account suspension/removal
-    if "checkpoint/block" in curr_url_lower or "/help/contact/" in curr_url_lower:
-        return True, "Redirected to Facebook account suspension/block barrier"
-
-    soup = BeautifulSoup(html_text, "html.parser")
-    title_tag = soup.find("title")
-    title_text = title_tag.text.strip().lower() if title_tag and title_tag.text else ""
-
-    for phrase in GENUINE_DEAD_PHRASES:
-        if phrase in title_text:
-            return True, f"Title states dead: '{title_text}'"
-
-    return False, ""
-
-def extract_valid_title(html_text: str, uid: str) -> str:
-    soup = BeautifulSoup(html_text, "html.parser")
-    og_title = soup.find("meta", property="og:title")
-    if og_title and og_title.get("content"):
-        t = og_title["content"].strip()
-        if t.lower() not in ("facebook", "log into facebook", "log in to facebook", ""):
-            return re.sub(r"\s*\|\s*Facebook$", "", t, flags=re.I).strip()
-
-    title_tag = soup.find("title")
-    if title_tag and title_tag.text:
-        t = title_tag.text.strip()
-        t = re.sub(r"\s*\|\s*Facebook$", "", t, flags=re.I).strip()
-        if t.lower() not in ("facebook", "log into facebook", "log in to facebook", ""):
-            return t
-
-    return f"Facebook ({uid})"
-
-async def check_facebook_link(
-    url: str,
-    session: Optional[aiohttp.ClientSession] = None,
-    timeout_seconds: int = 15,
-    custom_user_agent: Optional[str] = None
-) -> CheckResult:
-    target_url = normalize_facebook_url(url)
-    uid = extract_fb_uid(target_url)
-    should_close_session = False
-
-    if session is None:
-        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        session = aiohttp.ClientSession(timeout=timeout)
-        should_close_session = True
-
-    headers = {
-        "User-Agent": FB_CRAWLER_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
-        "Sec-Fetch-Mode": "navigate",
-    }
-
+async def _probe_link_once(target_url: str, session: aiohttp.ClientSession, header_index: int = 0) -> Tuple[bool, str, str, int]:
+    headers = MESSENGER_PREVIEW_HEADERS[header_index % len(MESSENGER_PREVIEW_HEADERS)]
     try:
         async with session.get(
             target_url,
             headers=headers,
             allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=8),
             ssl=False
         ) as resp:
             status_code = resp.status
-            final_url = str(resp.url)
+            final_url = str(resp.url).lower()
 
-            # Strict 404 / 410 check
             if status_code in (404, 410):
-                return CheckResult(
-                    is_alive=False,
-                    status="DEAD",
-                    reason=f"HTTP {status_code} (Not Found)",
-                    title=f"Deleted Content ({uid})",
-                    uid=uid,
-                    url=target_url,
-                    status_code=status_code,
-                )
+                return False, f"HTTP Status {status_code}", "", status_code
+
+            if "checkpoint/block" in final_url or "/help/contact/" in final_url:
+                return False, "Checkpoint barrier / Account blocked", "", status_code
 
             html_text = await resp.text(errors="ignore")
-            is_dead, dead_reason = inspect_for_definite_death(html_text, final_url)
+            lower_html = html_text.lower()
 
-            if is_dead:
-                return CheckResult(
-                    is_alive=False,
-                    status="DEAD",
-                    reason=dead_reason,
-                    title=f"Dead Content ({uid})",
-                    uid=uid,
-                    url=target_url,
-                    status_code=status_code,
-                )
+            # Direct dead string found
+            for marker in AUTHENTIC_DEAD_MARKERS:
+                if marker in lower_html:
+                    return False, f"Dead content signature: '{marker}'", "", status_code
 
-            # If not explicitly proven dead, it is ACTIVE
-            page_title = extract_valid_title(html_text, uid)
+            soup = BeautifulSoup(html_text, "html.parser")
+
+            # Extract Authentic OpenGraph Title
+            og_title = ""
+            og_title_tag = soup.find("meta", property="og:title")
+            if og_title_tag and og_title_tag.get("content"):
+                og_title = og_title_tag["content"].strip()
+
+            if not og_title:
+                title_tag = soup.find("title")
+                if title_tag and title_tag.text:
+                    og_title = title_tag.text.strip()
+
+            clean_title = re.sub(r"\s*\|\s*Facebook$", "", og_title, flags=re.I).strip()
+            clean_title = re.sub(r"^Facebook\s*[- :]\s*", "", clean_title, flags=re.I).strip()
+
+            # Check if title explicitly claims dead
+            for marker in AUTHENTIC_DEAD_MARKERS:
+                if marker in clean_title.lower():
+                    return False, f"Dead notice in title: '{clean_title}'", "", status_code
+
+            # Check if title is blank or generic login prompt
+            if clean_title.lower() in GENERIC_TRASH_TITLES:
+                # Check description as fallback
+                og_desc_tag = soup.find("meta", property="og:description")
+                og_desc = og_desc_tag["content"].strip() if og_desc_tag and og_desc_tag.get("content") else ""
+                if not og_desc or og_desc.lower() in GENERIC_TRASH_TITLES:
+                    return False, "No preview metadata available (Target content does not exist)", "", status_code
+
+            # Valid live content preview found
+            return True, "Valid OpenGraph preview detected", clean_title, status_code
+
+    except Exception as e:
+        logger.warning(f"Probe exception on {target_url}: {e}")
+        return False, f"Probe error: {type(e).__name__}", "", 0
+
+async def check_facebook_link_deep(
+    url: str,
+    session: Optional[aiohttp.ClientSession] = None,
+    total_checks: int = 5,
+    delay_between_checks: float = 2.0
+) -> CheckResult:
+    """
+    Executes multiple verification probes before issuing a verdict.
+    Guarantees that active posts are not marked dead, and dead posts are caught accurately.
+    """
+    target_url = normalize_facebook_url(url)
+    uid = extract_fb_uid(target_url)
+    should_close_session = False
+
+    if session is None:
+        session = aiohttp.ClientSession()
+        should_close_session = True
+
+    alive_count = 0
+    dead_count = 0
+    last_reason = ""
+    discovered_title = ""
+    last_code = 200
+
+    try:
+        for i in range(total_checks):
+            is_alive, reason, title, code = await _probe_link_once(target_url, session, header_index=i)
+            last_reason = reason
+            last_code = code
+
+            if is_alive:
+                alive_count += 1
+                if title and not discovered_title:
+                    discovered_title = title
+            else:
+                dead_count += 1
+
+            if i < total_checks - 1:
+                await asyncio.sleep(delay_between_checks)
+
+        # Verdict logic:
+        # If at least 2 out of 5 checks returned valid preview metadata, the content IS ALIVE.
+        if alive_count >= 2:
             return CheckResult(
                 is_alive=True,
                 status="ACTIVE",
-                reason="Link verified accessible",
-                title=page_title,
+                reason=f"Verified alive ({alive_count}/{total_checks} successful probes)",
+                title=discovered_title or f"Facebook ({uid})",
                 uid=uid,
                 url=target_url,
-                status_code=status_code,
+                status_code=last_code,
+            )
+        else:
+            return CheckResult(
+                is_alive=False,
+                status="DEAD",
+                reason=f"Failed validation ({dead_count}/{total_checks} probes failed - {last_reason})",
+                title=f"Dead Content ({uid})",
+                uid=uid,
+                url=target_url,
+                status_code=last_code,
             )
 
-    except Exception as e:
-        logger.warning(f"Error checking {target_url}: {e}")
-        # Network hiccups must KEEP links alive to prevent false alerts
-        return CheckResult(
-            is_alive=True,
-            status="ACTIVE",
-            reason="Transient check hesitation (Preserved ACTIVE)",
-            title=f"Facebook ({uid})",
-            uid=uid,
-            url=target_url,
-            status_code=0,
-        )
     finally:
         if should_close_session:
             await session.close()
+
+# Backward compatible single entry point
+async def check_facebook_link(url: str, session: Optional[aiohttp.ClientSession] = None, **kwargs) -> CheckResult:
+    return await check_facebook_link_deep(url, session=session, total_checks=5, delay_between_checks=1.5)

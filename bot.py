@@ -570,5 +570,12 @@ def main() -> None:
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-if __name__ == "__main__":
+import asyncio
+
+if __name__ == '__main__':
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    
     main()

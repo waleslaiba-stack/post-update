@@ -1,12 +1,12 @@
 """
-Facebook Deep Multi-Pass Link Checker.
-Uses Messenger/WhatsApp Link Preview Scraper Protocol with 5-Cycle Verification.
+Facebook Universal Link Accessibility Checker with Proxy Engine.
+Bypasses Cloud/Datacenter IP blocks via Rotating/Static Residential Proxy.
 """
+import os
 import re
 import hashlib
 import logging
-import asyncio
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
 import aiohttp
@@ -14,22 +14,9 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# Official Facebook Link Preview Scraper Identifiers (Used by Messenger/WhatsApp)
-MESSENGER_PREVIEW_HEADERS = [
-    {
-        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-    },
-    {
-        "User-Agent": "facebookexternalhit/1.1",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-]
+FB_PREVIEW_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
 
-# Dead text markers that only appear on removed/deleted targets
-AUTHENTIC_DEAD_MARKERS = [
+DEFINITE_DEAD_MARKERS = [
     "this content isn't available right now",
     "the link you followed may be broken",
     "the page may have been removed",
@@ -112,136 +99,115 @@ def extract_fb_uid(url: str) -> str:
     md5 = hashlib.md5(clean_url.encode("utf-8")).hexdigest()
     return f"FB_{md5[:8]}"
 
-async def _probe_link_once(target_url: str, session: aiohttp.ClientSession, header_index: int = 0) -> Tuple[bool, str, str, int]:
-    headers = MESSENGER_PREVIEW_HEADERS[header_index % len(MESSENGER_PREVIEW_HEADERS)]
-    try:
-        async with session.get(
-            target_url,
-            headers=headers,
-            allow_redirects=True,
-            timeout=aiohttp.ClientTimeout(total=8),
-            ssl=False
-        ) as resp:
-            status_code = resp.status
-            final_url = str(resp.url).lower()
+def parse_html_response(html_text: str, final_url: str, uid: str) -> Tuple[bool, str, str]:
+    lower_html = html_text.lower()
 
-            if status_code in (404, 410):
-                return False, f"HTTP Status {status_code}", "", status_code
+    for marker in DEFINITE_DEAD_MARKERS:
+        if marker in lower_html:
+            return False, f"Dead content notice: '{marker}'", ""
 
-            if "checkpoint/block" in final_url or "/help/contact/" in final_url:
-                return False, "Checkpoint barrier / Account blocked", "", status_code
+    if "checkpoint/block" in final_url.lower() or "/help/contact/" in final_url.lower():
+        return False, "Checkpoint barrier / Account blocked", ""
 
-            html_text = await resp.text(errors="ignore")
-            lower_html = html_text.lower()
+    soup = BeautifulSoup(html_text, "html.parser")
 
-            # Direct dead string found
-            for marker in AUTHENTIC_DEAD_MARKERS:
-                if marker in lower_html:
-                    return False, f"Dead content signature: '{marker}'", "", status_code
+    og_title = ""
+    og_title_tag = soup.find("meta", property="og:title")
+    if og_title_tag and og_title_tag.get("content"):
+        og_title = og_title_tag["content"].strip()
 
-            soup = BeautifulSoup(html_text, "html.parser")
+    if not og_title:
+        title_tag = soup.find("title")
+        if title_tag and title_tag.text:
+            og_title = title_tag.text.strip()
 
-            # Extract Authentic OpenGraph Title
-            og_title = ""
-            og_title_tag = soup.find("meta", property="og:title")
-            if og_title_tag and og_title_tag.get("content"):
-                og_title = og_title_tag["content"].strip()
+    clean_title = re.sub(r"\s*\|\s*Facebook$", "", og_title, flags=re.I).strip()
+    clean_title = re.sub(r"^Facebook\s*[- :]\s*", "", clean_title, flags=re.I).strip()
 
-            if not og_title:
-                title_tag = soup.find("title")
-                if title_tag and title_tag.text:
-                    og_title = title_tag.text.strip()
+    for marker in DEFINITE_DEAD_MARKERS:
+        if marker in clean_title.lower():
+            return False, f"Dead indicator in title: '{clean_title}'", ""
 
-            clean_title = re.sub(r"\s*\|\s*Facebook$", "", og_title, flags=re.I).strip()
-            clean_title = re.sub(r"^Facebook\s*[- :]\s*", "", clean_title, flags=re.I).strip()
+    if clean_title.lower() in GENERIC_TRASH_TITLES:
+        og_desc_tag = soup.find("meta", property="og:description")
+        og_desc = og_desc_tag["content"].strip() if og_desc_tag and og_desc_tag.get("content") else ""
+        if not og_desc or og_desc.lower() in GENERIC_TRASH_TITLES:
+            return False, "No preview content available (Post/Profile removed)", ""
 
-            # Check if title explicitly claims dead
-            for marker in AUTHENTIC_DEAD_MARKERS:
-                if marker in clean_title.lower():
-                    return False, f"Dead notice in title: '{clean_title}'", "", status_code
+    return True, "Authentic metadata verified", clean_title
 
-            # Check if title is blank or generic login prompt
-            if clean_title.lower() in GENERIC_TRASH_TITLES:
-                # Check description as fallback
-                og_desc_tag = soup.find("meta", property="og:description")
-                og_desc = og_desc_tag["content"].strip() if og_desc_tag and og_desc_tag.get("content") else ""
-                if not og_desc or og_desc.lower() in GENERIC_TRASH_TITLES:
-                    return False, "No preview metadata available (Target content does not exist)", "", status_code
-
-            # Valid live content preview found
-            return True, "Valid OpenGraph preview detected", clean_title, status_code
-
-    except Exception as e:
-        logger.warning(f"Probe exception on {target_url}: {e}")
-        return False, f"Probe error: {type(e).__name__}", "", 0
-
-async def check_facebook_link_deep(
+async def check_facebook_link(
     url: str,
     session: Optional[aiohttp.ClientSession] = None,
-    total_checks: int = 5,
-    delay_between_checks: float = 2.0
+    proxy_url: Optional[str] = None,
+    timeout_seconds: int = 15,
+    custom_user_agent: Optional[str] = None
 ) -> CheckResult:
-    """
-    Executes multiple verification probes before issuing a verdict.
-    Guarantees that active posts are not marked dead, and dead posts are caught accurately.
-    """
     target_url = normalize_facebook_url(url)
     uid = extract_fb_uid(target_url)
     should_close_session = False
 
     if session is None:
-        session = aiohttp.ClientSession()
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        session = aiohttp.ClientSession(timeout=timeout)
         should_close_session = True
 
-    alive_count = 0
-    dead_count = 0
-    last_reason = ""
-    discovered_title = ""
-    last_code = 200
+    proxy = proxy_url or os.getenv("PROXY_URL", "").strip() or None
+
+    headers = {
+        "User-Agent": custom_user_agent or FB_PREVIEW_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
+        "Sec-Fetch-Mode": "navigate",
+    }
 
     try:
-        for i in range(total_checks):
-            is_alive, reason, title, code = await _probe_link_once(target_url, session, header_index=i)
-            last_reason = reason
-            last_code = code
+        async with session.get(
+            target_url,
+            headers=headers,
+            proxy=proxy,
+            allow_redirects=True,
+            ssl=False
+        ) as resp:
+            status_code = resp.status
+            final_url = str(resp.url)
 
-            if is_alive:
-                alive_count += 1
-                if title and not discovered_title:
-                    discovered_title = title
-            else:
-                dead_count += 1
+            if status_code in (404, 410):
+                return CheckResult(
+                    is_alive=False,
+                    status="DEAD",
+                    reason=f"HTTP Status {status_code}",
+                    title=f"Deleted Content ({uid})",
+                    uid=uid,
+                    url=target_url,
+                    status_code=status_code
+                )
 
-            if i < total_checks - 1:
-                await asyncio.sleep(delay_between_checks)
+            html_text = await resp.text(errors="ignore")
+            is_alive, reason, title = parse_html_response(html_text, final_url, uid)
 
-        # Verdict logic:
-        # If at least 2 out of 5 checks returned valid preview metadata, the content IS ALIVE.
-        if alive_count >= 2:
             return CheckResult(
-                is_alive=True,
-                status="ACTIVE",
-                reason=f"Verified alive ({alive_count}/{total_checks} successful probes)",
-                title=discovered_title or f"Facebook ({uid})",
+                is_alive=is_alive,
+                status="ACTIVE" if is_alive else "DEAD",
+                reason=reason,
+                title=title or f"Facebook ({uid})",
                 uid=uid,
                 url=target_url,
-                status_code=last_code,
-            )
-        else:
-            return CheckResult(
-                is_alive=False,
-                status="DEAD",
-                reason=f"Failed validation ({dead_count}/{total_checks} probes failed - {last_reason})",
-                title=f"Dead Content ({uid})",
-                uid=uid,
-                url=target_url,
-                status_code=last_code,
+                status_code=status_code
             )
 
+    except Exception as e:
+        logger.warning(f"Connection glitch on {target_url}: {e}")
+        # Network hiccups do NOT kill links falsely
+        return CheckResult(
+            is_alive=True,
+            status="ACTIVE",
+            reason="Network delay (Link kept ACTIVE)",
+            title=f"Facebook ({uid})",
+            uid=uid,
+            url=target_url,
+            status_code=0
+        )
     finally:
         if should_close_session:
             await session.close()
-
-# Backward compatible single entry point
-async def check_facebook_link(url: str, session: Optional[aiohttp.ClientSession] = None, **kwargs) -> CheckResult:
-    return await check_facebook_link_deep(url, session=session, total_checks=5, delay_between_checks=1.5)

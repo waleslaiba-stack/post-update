@@ -1,11 +1,11 @@
 """
-Facebook Universal Link Accessibility Checker (Crawler Preview Engine).
-Uses official Facebook external crawler identity to eliminate login redirects
-and strictly validates real post/profile content vs dead/deleted links.
+Facebook Universal Link Accessibility Checker (Anti-Rate-Limit & Multi-Retry Engine).
+Ensures transient network glitches or Facebook rate-limits do NOT trigger false DEAD alerts.
 """
 import re
 import hashlib
 import logging
+import asyncio
 from typing import Optional, Tuple
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
@@ -14,10 +14,9 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# Official Facebook Crawler UA: bypasses human login walls and receives pure preview metadata
 FB_CRAWLER_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
 
-# Text explicitly meaning the content is GONE
+# Text that strictly appears ONLY when the content is permanently deleted or removed
 DEAD_PHRASES = [
     "this content isn't available right now",
     "this content is not available",
@@ -35,10 +34,8 @@ DEAD_PHRASES = [
     "este contenido no está disponible",
     "ce contenido no está disponible",
     "inhalt derzeit nicht verfügbar",
-    "content unavailable",
 ]
 
-# Generic text that Facebook shows when a page is dead or blocked
 GENERIC_LOGIN_PHRASES = [
     "log into facebook",
     "log in to facebook",
@@ -115,18 +112,16 @@ def is_generic_or_empty(text: str) -> bool:
 def parse_html_response(html_text: str, final_url: str, uid: str) -> Tuple[bool, str, str]:
     lower_html = html_text.lower()
 
-    # 1. Explicit dead string check in the HTML body
+    # Check for definite dead markers
     for phrase in DEAD_PHRASES:
         if phrase in lower_html:
             return False, f"Dead marker: '{phrase}'", f"Removed Content ({uid})"
 
-    # 2. Redirected to help or checkpoint
     if "/help/" in final_url.lower() or "checkpoint" in final_url.lower():
         return False, "Checkpoint/Help redirect", f"Dead Content ({uid})"
 
     soup = BeautifulSoup(html_text, "html.parser")
 
-    # 3. Extract OpenGraph and Title
     og_title_tag = soup.find("meta", property="og:title")
     og_title = og_title_tag["content"].strip() if og_title_tag and og_title_tag.get("content") else ""
 
@@ -136,17 +131,13 @@ def parse_html_response(html_text: str, final_url: str, uid: str) -> Tuple[bool,
     page_title_tag = soup.find("title")
     page_title = page_title_tag.text.strip() if page_title_tag and page_title_tag.text else ""
 
-    # Clean Facebook brand suffixes
     clean_title = re.sub(r"\s*\|\s*Facebook$", "", og_title or page_title, flags=re.I).strip()
     clean_title = re.sub(r"^Facebook\s*[- :]\s*", "", clean_title, flags=re.I).strip()
 
-    # 4. Check if title explicitly contains dead phrases
     for phrase in DEAD_PHRASES:
         if phrase in clean_title.lower():
             return False, f"Dead notice in title: '{clean_title}'", f"Removed Content ({uid})"
 
-    # 5. Strict Active Validation:
-    # If the title or description is generic Facebook login text, it means Facebook did NOT find the content!
     has_real_title = not is_generic_or_empty(clean_title)
     has_real_desc = not is_generic_or_empty(og_desc)
 
@@ -156,24 +147,10 @@ def parse_html_response(html_text: str, final_url: str, uid: str) -> Tuple[bool,
     if has_real_desc:
         return True, "Authentic description verified", og_desc[:40] + "..."
 
-    # If neither real title nor real description exists, content is DEAD
+    # If Facebook returns an empty shell, consider it dead only if explicitly not active
     return False, "No authentic post/profile metadata found", f"Dead Content ({uid})"
 
-async def check_facebook_link(
-    url: str,
-    session: Optional[aiohttp.ClientSession] = None,
-    timeout_seconds: int = 15,
-    custom_user_agent: Optional[str] = None
-) -> CheckResult:
-    target_url = normalize_facebook_url(url)
-    uid = extract_fb_uid(target_url)
-    should_close_session = False
-
-    if session is None:
-        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        session = aiohttp.ClientSession(timeout=timeout)
-        should_close_session = True
-
+async def _single_fetch(target_url: str, session: aiohttp.ClientSession, uid: str) -> Tuple[Optional[bool], str, str, int]:
     headers = {
         "User-Agent": FB_CRAWLER_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -186,47 +163,111 @@ async def check_facebook_link(
             target_url,
             headers=headers,
             allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=12),
             ssl=False
         ) as resp:
             status_code = resp.status
             final_url = str(resp.url)
 
-            # 404 / 410 is definitely DEAD
             if status_code in (404, 410):
-                return CheckResult(
-                    is_alive=False,
-                    status="DEAD",
-                    reason=f"HTTP Status {status_code}",
-                    title=f"Deleted Content ({uid})",
-                    uid=uid,
-                    url=target_url,
-                    status_code=status_code,
-                )
+                return False, f"HTTP Status {status_code}", f"Deleted Content ({uid})", status_code
+
+            # If Facebook rate limits (429 or 5xx), return None (Unknown - do not kill!)
+            if status_code in (429, 500, 502, 503, 504):
+                return None, f"Facebook temporary server status {status_code}", "", status_code
 
             html_text = await resp.text(errors="ignore")
             is_alive, reason, title = parse_html_response(html_text, final_url, uid)
+            return is_alive, reason, title, status_code
 
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        # Transient network issues should NOT kill active links
+        logger.warning(f"Temporary network issue on {target_url}: {e}")
+        return None, "Temporary connection delay", "", 0
+    except Exception as e:
+        logger.error(f"Unexpected error on {target_url}: {e}")
+        return None, f"Glitch: {str(e)}", "", 0
+
+async def check_facebook_link(
+    url: str,
+    session: Optional[aiohttp.ClientSession] = None,
+    timeout_seconds: int = 15,
+    custom_user_agent: Optional[str] = None
+) -> CheckResult:
+    target_url = normalize_facebook_url(url)
+    uid = extract_fb_uid(target_url)
+    should_close_session = False
+
+    if session is None:
+        session = aiohttp.ClientSession()
+        should_close_session = True
+
+    try:
+        # Pass 1 Check
+        is_alive, reason, title, code = await _single_fetch(target_url, session, uid)
+
+        # If confirmed ACTIVE, return immediately
+        if is_alive is True:
             return CheckResult(
-                is_alive=is_alive,
-                status="ACTIVE" if is_alive else "DEAD",
+                is_alive=True,
+                status="ACTIVE",
                 reason=reason,
                 title=title,
                 uid=uid,
                 url=target_url,
-                status_code=status_code,
+                status_code=code,
             )
 
-    except Exception as e:
-        logger.warning(f"Error checking link {target_url}: {e}")
+        # If network glitched or temporary delay, KEEP ACTIVE to prevent false dead alerts
+        if is_alive is None:
+            return CheckResult(
+                is_alive=True,
+                status="ACTIVE",
+                reason="Temporary Facebook delay (Link retained ACTIVE)",
+                title=f"Facebook ({uid})",
+                uid=uid,
+                url=target_url,
+                status_code=code,
+            )
+
+        # Pass 2 Retry Verification (If Pass 1 suggested DEAD, wait 3 seconds and confirm)
+        await asyncio.sleep(3.0)
+        retry_alive, retry_reason, retry_title, retry_code = await _single_fetch(target_url, session, uid)
+
+        if retry_alive is True:
+            return CheckResult(
+                is_alive=True,
+                status="ACTIVE",
+                reason=retry_reason,
+                title=retry_title,
+                uid=uid,
+                url=target_url,
+                status_code=retry_code,
+            )
+
+        # If even retry failed with network issue, do not falsely kill it
+        if retry_alive is None:
+            return CheckResult(
+                is_alive=True,
+                status="ACTIVE",
+                reason="Network hesitation (Link retained ACTIVE)",
+                title=f"Facebook ({uid})",
+                uid=uid,
+                url=target_url,
+                status_code=retry_code,
+            )
+
+        # If both Pass 1 and Retry confirm DEAD, then declare DEAD
         return CheckResult(
             is_alive=False,
             status="DEAD",
-            reason=f"Connection failure: {type(e).__name__}",
-            title=f"Dead Link ({uid})",
+            reason=retry_reason or reason,
+            title=retry_title or title or f"Dead Content ({uid})",
             uid=uid,
             url=target_url,
-            status_code=0,
+            status_code=retry_code or code,
         )
+
     finally:
         if should_close_session:
             await session.close()

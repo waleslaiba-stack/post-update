@@ -1,8 +1,7 @@
 """
 Facebook Post Monitor Telegram Bot (Production Ready)
 - Auto Admin Approval Workflow (Interactive Alert Cards)
-- Anti-Spam protection on reject
-- Direct Admin /block and /unblock commands
+- Left: [User Name (ID)] | Right: [Block/Unblock Toggle]
 - Per-User Local Timezone Engine (Default: Asia/Dhaka)
 - Telegram Spoiler Tag Support for Hide Info
 - Instant DEAD Alert on Invalid/Dead Links
@@ -63,7 +62,6 @@ FB_URL_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Timezone converter helper
 async def get_user_now(chat_id: int) -> Tuple[datetime, str]:
     user = await db.get_user(chat_id)
     tz_str = user["timezone"] if user and user.get("timezone") else "Asia/Dhaka"
@@ -104,13 +102,11 @@ def format_processing_time(created_utc_str: str, updated_utc_str: str) -> str:
     parts.append(f"{seconds} seconds")
     return " ".join(parts)
 
-# Access Control Verification
 async def verify_user_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if not user:
         return False
 
-    # Admin is permanently authorized
     if ADMIN_ID and user.id == ADMIN_ID:
         return True
 
@@ -134,7 +130,6 @@ async def verify_user_access(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return False
 
-    # New user: create record & notify Admin
     await db.add_or_update_request(user.id, user.first_name, user.username)
     await update.effective_message.reply_text(
         "👋 <b>Welcome!</b>\nThis bot is private. An access request has been sent to the Admin. You will receive a notification as soon as you are approved.",
@@ -245,7 +240,6 @@ async def build_dead_message(link_data: dict, chat_id: int, is_hidden: bool = Fa
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
-# ================= Commands =================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await verify_user_access(update, context):
         return
@@ -535,7 +529,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not raw_urls:
         if user.id in user_states and user_states[user.id] == "AWAITING_LINKS":
             await update.message.reply_text(
-                "⚠️ No valid Facebook links detected. Send a link containing facebook.com or fb.watch, or /cancel."
+                "⚠️ No valid Facebook links detected. Send a link containing facebook.com or fb.watch, or type /cancel."
             )
         return
 
@@ -568,7 +562,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
             if record:
-                # If already DEAD, alert directly as DEAD
                 if not check_result.is_alive or check_result.status == "DEAD":
                     await db.update_status(record["id"], status="DEAD", die_alert_sent=1)
                     updated_record = await db.get_link_by_id(record["id"])
@@ -639,33 +632,87 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if not await verify_user_access(update, context):
         return
 
-    # Admin User Management List
+    # Admin User Management List with Left/Right Buttons
     if data == "adm_list_users":
         if user.id != ADMIN_ID:
             return
         users = await db.get_all_users()
-        text = "👥 <b>Registered Users Management:</b>\n\n"
+        text = "👥 <b>Registered Users Management:</b>\nClick the button on the right to toggle access:\n\n"
         keyboard = []
-        for u in users[:15]:
-            status_emoji = "🟢" if u["status"] == "APPROVED" else ("⏳" if u["status"] == "PENDING" else "🚫")
-            text += f"{status_emoji} <b>{html.escape(u['first_name'] or 'User')}</b> | ID: <code>{u['user_id']}</code> | {u['status']}\n"
-            action_btn = (
-                InlineKeyboardButton("🚫 Block", callback_data=f"adm_block_{u['user_id']}")
-                if u["status"] == "APPROVED"
-                else InlineKeyboardButton("🟢 Approve", callback_data=f"adm_appr_{u['user_id']}")
-            )
-            keyboard.append([action_btn])
+        for u in users[:20]:
+            uid_val = u["user_id"]
+            name_val = html.escape((u["first_name"] or "User")[:14])
+            is_approved = (u["status"] == "APPROVED")
+            
+            status_icon = "🟢" if is_approved else "🔴"
+            user_label = f"{status_icon} {name_val} ({uid_val})"
+            action_label = "🚫 Block" if is_approved else "🟢 Unblock"
+            action_data = f"adm_toggle_{uid_val}"
+
+            keyboard.append([
+                InlineKeyboardButton(user_label, callback_data=f"adm_noop_{uid_val}"),
+                InlineKeyboardButton(action_label, callback_data=action_data)
+            ])
+
         keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
         return
 
-    if data.startswith("adm_block_"):
+    # Instant Toggle Block / Unblock
+    if data.startswith("adm_toggle_"):
         if user.id != ADMIN_ID:
             return
         target_uid = int(data.split("_")[2])
-        await db.set_user_status(target_uid, "REJECTED")
-        await query.answer("User blocked.")
-        await handle_callback_query(update, context)
+        target_user = await db.get_user(target_uid)
+        
+        if target_user and target_user["status"] == "APPROVED":
+            await db.set_user_status(target_uid, "REJECTED")
+            await query.answer(f"User {target_uid} Blocked!", show_alert=False)
+            try:
+                await context.bot.send_message(
+                    chat_id=target_uid,
+                    text="⛔ <b>Notice:</b> Your access to this bot has been revoked by the administrator.",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+        else:
+            await db.set_user_status(target_uid, "APPROVED")
+            await query.answer(f"User {target_uid} Unblocked / Approved!", show_alert=False)
+            try:
+                await context.bot.send_message(
+                    chat_id=target_uid,
+                    text="🎉 <b>Your access has been APPROVED!</b>\nYou can now send Facebook links to monitor.",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+
+        # Re-render list with updated button state instantly
+        users = await db.get_all_users()
+        text = "👥 <b>Registered Users Management:</b>\nClick the button on the right to toggle access:\n\n"
+        keyboard = []
+        for u in users[:20]:
+            uid_val = u["user_id"]
+            name_val = html.escape((u["first_name"] or "User")[:14])
+            is_approved = (u["status"] == "APPROVED")
+            
+            status_icon = "🟢" if is_approved else "🔴"
+            user_label = f"{status_icon} {name_val} ({uid_val})"
+            action_label = "🚫 Block" if is_approved else "🟢 Unblock"
+            action_data = f"adm_toggle_{uid_val}"
+
+            keyboard.append([
+                InlineKeyboardButton(user_label, callback_data=f"adm_noop_{uid_val}"),
+                InlineKeyboardButton(action_label, callback_data=action_data)
+            ])
+
+        keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+        return
+
+    if data.startswith("adm_noop_"):
+        await query.answer("User record")
         return
 
     # Timezone Change Menu
@@ -980,7 +1027,6 @@ def main() -> None:
         .build()
     )
 
-    # Standard Commands
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("add", cmd_add))
     application.add_handler(CommandHandler("list", cmd_list))
@@ -988,7 +1034,6 @@ def main() -> None:
     application.add_handler(CommandHandler("tools", cmd_tools))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
 
-    # Admin Exclusive Commands
     application.add_handler(CommandHandler("block", cmd_block))
     application.add_handler(CommandHandler("unblock", cmd_unblock))
     application.add_handler(CommandHandler("approve", cmd_unblock))

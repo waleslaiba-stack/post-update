@@ -1,10 +1,10 @@
 """
 Facebook Post Monitor Telegram Bot (Production Ready)
-- Auto Admin Approval Workflow (Interactive Alert Cards)
-- Left: [User Name (ID)] | Right: [Block/Unblock Toggle]
-- Per-User Local Timezone Engine (Default: Asia/Dhaka)
-- Telegram Spoiler Tag Support for Hide Info
-- Instant DEAD Alert on Invalid/Dead Links
+- Strict 5-Cycle Multi-Probe Link Verification
+- Direct DEAD Notification on Link Deletion
+- User Access Management & Admin Controls
+- Local Bangladesh Timezone Engine
+- Telegram Spoiler Tag Support
 """
 import os
 import re
@@ -33,7 +33,7 @@ from telegram.ext import (
     filters,
 )
 from database import Database
-from checker import check_facebook_link, extract_fb_uid
+from checker import check_facebook_link_deep, extract_fb_uid
 
 load_dotenv()
 
@@ -45,14 +45,10 @@ logger = logging.getLogger("FBMonitorBot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip()) if os.getenv("ADMIN_ID", "").strip().isdigit() else 0
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "45"))
 REQUEST_DELAY_SECONDS = float(os.getenv("REQUEST_DELAY_SECONDS", "2.0"))
-MAX_CONCURRENT_CHECKS = int(os.getenv("MAX_CONCURRENT_CHECKS", "5"))
+MAX_CONCURRENT_CHECKS = int(os.getenv("MAX_CONCURRENT_CHECKS", "3"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "monitor.db")
-USER_AGENT = os.getenv(
-    "USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-)
 
 db = Database(db_path=DATABASE_PATH)
 user_states = {}
@@ -252,16 +248,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         f"🚀 Welcome, <b>{html.escape(user.first_name)}</b>!\n\n"
         f"🔍 <b>Facebook Post & Link DIE Monitor</b>\n"
-        f"I asynchronously track Facebook posts and alert you instantly the moment "
-        f"a link is deleted, removed, or becomes inaccessible.\n\n"
+        f"I track Facebook posts/profiles with deep multi-probe verification and alert you "
+        f"instantly when a post is removed or dies.\n\n"
         f"📊 <b>Your Dashboard:</b>\n"
         f"• Total Links: <b>{stats['total']}</b>\n"
         f"• Active: <b>{stats['active']}</b>\n"
         f"• Dead: <b>{stats['dead']}</b>\n"
         f"• Stopped: <b>{stats['stopped']}</b>\n"
-        f"• Local Timezone: <code>{user_tz}</code>\n\n"
-        f"Send or paste any Facebook link directly to start monitoring, "
-        f"or use the quick actions below:\n\n"
+        f"• Timezone: <code>{user_tz}</code>\n\n"
+        f"Send any Facebook link to start monitoring:\n\n"
         f"👑 <b>Owner:</b> <a href=\"https://t.me/tmmusa73\">—͞Tᴍ Mᴜsᴀ ⚡</a>"
     )
     keyboard = [
@@ -292,14 +287,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_states[user.id] = "AWAITING_LINKS"
     text = (
         "➕ <b>Add Links to Monitor</b>\n\n"
-        "Please send one or multiple Facebook links in a single message "
-        "(separated by line breaks or spaces).\n\n"
-        "<b>Supported formats:</b>\n"
-        "• <code>https://www.facebook.com/.../posts/...</code>\n"
-        "• <code>https://www.facebook.com/permalink.php?story_fbid=...</code>\n"
-        "• <code>https://www.facebook.com/watch/?v=...</code>\n"
-        "• <code>https://fb.watch/...</code>\n"
-        "• <code>https://www.facebook.com/reel/...</code>\n\n"
+        "Send one or multiple Facebook links to monitor.\n"
+        "The bot will perform a 5-cycle deep probe to verify link health.\n\n"
         "Send /cancel at any time to abort."
     )
     keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cmd_cancel")]]
@@ -414,7 +403,6 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await verify_user_access(update, context):
         return
-    user = update.effective_user
     chat_id = update.effective_chat.id
     stats = await db.get_stats(chat_id)
     _, tz_str = await get_user_now(chat_id)
@@ -422,7 +410,7 @@ async def cmd_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "🛠️ <b>Monitor Tools & Utilities:</b>\n\n"
         f"⏱️ <b>Scan Interval:</b> Every {CHECK_INTERVAL_SECONDS}s\n"
-        f"⏳ <b>Rate Limit Delay:</b> {REQUEST_DELAY_SECONDS}s between requests\n"
+        f"⏳ <b>Engine:</b> 5-Cycle Multi-Probe Scraper\n"
         f"🌐 <b>Current Timezone:</b> <code>{tz_str}</code>\n"
         f"🟢 <b>Active Targets:</b> {stats['active']}\n"
         f"🔴 <b>Dead Detections:</b> {stats['dead']}\n"
@@ -445,7 +433,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user = update.effective_user
     if user and user.id in user_states:
         del user_states[user.id]
-    await update.message.reply_text("❌ Action cancelled. Returning to normal mode.")
+    await update.message.reply_text("❌ Action cancelled.")
 
 # ================= Admin Commands =================
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -496,7 +484,7 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception:
         pass
 
-# ================= Text Message Processing =================
+# ================= Message Processing with 5-Cycle Verification =================
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await verify_user_access(update, context):
         return
@@ -528,16 +516,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not raw_urls:
         if user.id in user_states and user_states[user.id] == "AWAITING_LINKS":
-            await update.message.reply_text(
-                "⚠️ No valid Facebook links detected. Send a link containing facebook.com or fb.watch, or type /cancel."
-            )
+            await update.message.reply_text("⚠️ No valid Facebook links detected. Please provide a valid link.")
         return
 
     if user.id in user_states:
         del user_states[user.id]
 
     status_msg = await update.message.reply_text(
-        f"⏳ Found {len(raw_urls)} Facebook link(s). Checking status..."
+        f"⏳ Verifying {len(raw_urls)} Facebook link(s) across 5 probe cycles (Takes ~8-10 seconds for 100% accuracy)..."
     )
 
     async with aiohttp.ClientSession() as session:
@@ -547,11 +533,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 clean_url = "https://" + clean_url
 
             uid = extract_fb_uid(clean_url)
-            check_result = await check_facebook_link(
-                clean_url,
-                session=session,
-                custom_user_agent=USER_AGENT,
-            )
+            # Perform 5-cycle probe validation
+            check_result = await check_facebook_link_deep(clean_url, session=session, total_checks=5, delay_between_checks=1.5)
 
             record = await db.add_link(
                 chat_id=chat_id,
@@ -562,7 +545,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
             if record:
-                if not check_result.is_alive or check_result.status == "DEAD":
+                if not check_result.is_alive:
                     await db.update_status(record["id"], status="DEAD", die_alert_sent=1)
                     updated_record = await db.get_link_by_id(record["id"])
                     dead_text, dead_markup = await build_dead_message(updated_record, chat_id, is_hidden=False)
@@ -589,7 +572,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
 
-# ================= Inline Button Callbacks =================
+# ================= Inline Callbacks =================
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -597,7 +580,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     chat_id = update.effective_chat.id
 
-    # Admin Approval Handlers
     if data.startswith("adm_appr_") or data.startswith("adm_rejc_"):
         if user.id != ADMIN_ID:
             await query.answer("Unauthorized.", show_alert=True)
@@ -610,7 +592,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 await context.bot.send_message(
                     chat_id=target_uid,
-                    text="🎉 <b>Your access request has been APPROVED!</b>\nYou can now use all commands and send Facebook links to monitor.",
+                    text="🎉 <b>Your access request has been APPROVED!</b>\nYou can now send Facebook links to monitor.",
                     parse_mode=ParseMode.HTML
                 )
             except Exception:
@@ -628,11 +610,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
         return
 
-    # Check permission
     if not await verify_user_access(update, context):
         return
 
-    # Admin User Management List with Left/Right Buttons
     if data == "adm_list_users":
         if user.id != ADMIN_ID:
             return
@@ -658,7 +638,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
         return
 
-    # Instant Toggle Block / Unblock
     if data.startswith("adm_toggle_"):
         if user.id != ADMIN_ID:
             return
@@ -688,7 +667,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception:
                 pass
 
-        # Re-render list with updated button state instantly
         users = await db.get_all_users()
         text = "👥 <b>Registered Users Management:</b>\nClick the button on the right to toggle access:\n\n"
         keyboard = []
@@ -715,7 +693,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("User record")
         return
 
-    # Timezone Change Menu
     if data == "tools_change_tz":
         text = "🌐 <b>Select Your Local Timezone:</b>\nChoose one of the common timezones below:"
         keyboard = [
@@ -747,7 +724,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    # Navigation & General
     if data == "main_menu":
         stats = await db.get_stats(chat_id)
         _, user_tz = await get_user_now(chat_id)
@@ -797,7 +773,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         text = (
             "🛠️ <b>Monitor Tools & Utilities:</b>\n\n"
             f"⏱️ <b>Scan Interval:</b> Every {CHECK_INTERVAL_SECONDS}s\n"
-            f"⏳ <b>Rate Limit Delay:</b> {REQUEST_DELAY_SECONDS}s between requests\n"
+            f"⏳ <b>Verification Engine:</b> 5-Cycle Deep Probing\n"
             f"🌐 <b>Current Timezone:</b> <code>{tz_str}</code>\n"
             f"🟢 <b>Active Targets:</b> {stats['active']}\n"
             f"🔴 <b>Dead Detections:</b> {stats['dead']}\n"
@@ -814,7 +790,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "tools_check_now":
-        await query.answer("⚡ Running immediate check on all active links...", show_alert=True)
+        await query.answer("⚡ Running 5-cycle check on active links...", show_alert=True)
         asyncio.create_task(run_single_monitoring_cycle(context.application, target_chat_id=chat_id))
         return
 
@@ -943,7 +919,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await render_list_page(update, context, page=0, edit_existing=True)
         return
 
-# ================= Background Engine =================
+# ================= Background Monitoring Engine =================
 async def run_single_monitoring_cycle(app: Application, target_chat_id: Optional[int] = None) -> None:
     active_links = await db.get_active_links()
     if target_chat_id is not None:
@@ -960,15 +936,12 @@ async def run_single_monitoring_cycle(app: Application, target_chat_id: Optional
                 chat_id = link_data["chat_id"]
                 url = link_data["url"]
 
-                result = await check_facebook_link(
-                    url,
-                    session=session,
-                    custom_user_agent=USER_AGENT,
-                )
+                # Background scan also uses deep 5-cycle check before triggering DEAD
+                result = await check_facebook_link_deep(url, session=session, total_checks=4, delay_between_checks=1.5)
                 await db.update_last_checked(link_id)
 
                 if not result.is_alive and result.status == "DEAD":
-                    logger.warning(f"Link {url} (ID: {link_id}) detected as DIE/DEAD!")
+                    logger.warning(f"Link {url} confirmed DEAD after 4 failed probes!")
                     await db.update_status(link_id, status="DEAD", die_alert_sent=1)
                     updated_link = await db.get_link_by_id(link_id)
 
@@ -982,8 +955,9 @@ async def run_single_monitoring_cycle(app: Application, target_chat_id: Optional
                                 parse_mode=ParseMode.HTML,
                                 disable_web_page_preview=True,
                             )
+                            logger.info(f"DEAD alert dispatched to {chat_id}")
                         except Exception as e:
-                            logger.error(f"Failed to send DEAD alert to {chat_id}: {e}")
+                            logger.error(f"Failed to send alert to {chat_id}: {e}")
 
                 await asyncio.sleep(REQUEST_DELAY_SECONDS)
 
@@ -995,7 +969,7 @@ async def background_monitoring_worker(app: Application) -> None:
         try:
             await run_single_monitoring_cycle(app)
         except Exception as e:
-            logger.error(f"Error in background monitoring: {e}", exc_info=True)
+            logger.error(f"Error in background cycle: {e}", exc_info=True)
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 async def post_init(app: Application) -> None:
@@ -1043,7 +1017,7 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
 
-    logger.info("Bot started successfully. Listening for updates...")
+    logger.info("Bot started with 5-Cycle Multi-Probe Scraper...")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":

@@ -1,67 +1,47 @@
 """
-Facebook Universal Link Accessibility Checker via Real Headless Browser (Playwright).
-Renders full JavaScript, bypasses bot walls, and inspects real DOM content.
+Facebook Link Accessibility Checker.
+Asynchronously checks if Facebook posts/links are alive or have died (removed, deleted, inaccessible).
 """
+
 import re
-import os
+import random
 import hashlib
 import logging
 import asyncio
-from typing import Optional
+from typing import Optional, Tuple
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
-from playwright.async_api import async_playwright, Browser, BrowserContext
+import aiohttp
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# Real Android Mobile view gives zero-friction rendering on Facebook
-MOBILE_USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36"
-)
-
-DEFINITE_DEAD_MARKERS = [
-    # English
-    "this content isn't available right now",
-    "this content is not available",
-    "the link you followed may be broken",
-    "the page may have been removed",
-    "content not found",
-    "page not found",
-    "this page isn't available",
-    "attachment unavailable",
-    "sorry, this content isn't available",
-    "profile not found",
-    "account not found",
-    "this post has been deleted",
-    "it may have been deleted",
-    "broken link",
-    # Bengali
-    "এই কন্টেন্টটি এখন উপলভ্য নয়",
-    "এই কন্টেন্টটি উপলব্ধ নয়",
-    "এই পেজটি উপলভ্য নয়",
-    "এই পৃষ্ঠাটি উপলভ্য নয়",
-    "লিঙ্কটি কাজ নাও করতে পারে",
-    "পৃষ্ঠাটি সরিয়ে নেওয়া হতে পারে",
-    "কন্টেন্ট পাওয়া যায়নি",
-    "সংযুক্তি উপলভ্য নয়",
-    # Other common localized strings
-    "nội dung này hiện không khả dụng",
-    "este contenido no está disponible",
-    "ce contenido no está disponible",
-    "inhalt derzeit nicht verfügbar",
+# Desktop and Mobile user-agents to simulate legitimate web requests
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36"
 ]
 
-GENERIC_LOGINS = [
-    "facebook",
-    "log into facebook",
-    "log in to facebook",
-    "log in",
-    "facebook - log in or sign up",
-    "error",
-    "লগ ইন",
-    "লগইন",
+# Signatures in HTML or title that indicate Facebook content has been removed or is dead
+DEAD_PATTERNS = [
+    re.compile(r"This content isn't available right now", re.I),
+    re.compile(r"The link you followed may be broken", re.I),
+    re.compile(r"or the page may have been removed", re.I),
+    re.compile(r"Content Not Found", re.I),
+    re.compile(r"Page Not Found", re.I),
+    re.compile(r"This page isn't available", re.I),
+    re.compile(r"Attachment Unavailable", re.I),
+    re.compile(r"Sorry, something went wrong", re.I),
+    re.compile(r"Nội dung này hiện không khả dụng", re.I),  # Vietnamese common
+    re.compile(r"Liên kết bạn đã theo dõi có thể bị hỏng", re.I),
+    re.compile(r"Este contenido no está disponible", re.I),  # Spanish
+    re.compile(r"Ce contenu n'est pas disponible", re.I),    # French
+    re.compile(r"Inhalt derzeit nicht verfügbar", re.I),     # German
 ]
+
 
 @dataclass
 class CheckResult:
@@ -73,227 +53,230 @@ class CheckResult:
     url: str
     status_code: int = 200
 
-_playwright_instance = None
-_browser_instance: Optional[Browser] = None
-_browser_lock = asyncio.Lock()
-
-async def get_browser() -> Browser:
-    global _playwright_instance, _browser_instance
-    async with _browser_lock:
-        if _browser_instance is None or not _browser_instance.is_connected():
-            _playwright_instance = await async_playwright().start()
-            _browser_instance = await _playwright_instance.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--single-process",
-                ]
-            )
-        return _browser_instance
-
-def normalize_facebook_url(raw_url: str) -> str:
-    url = raw_url.strip().rstrip(",.;!$*")
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    elif url.startswith("http://"):
-        url = "https://" + url[7:]
-
-    # Transform to mobile endpoint for lighter, cleaner rendering
-    url = re.sub(r"^(https?://)(?:www\.|web\.|mbasic\.)?facebook\.com", r"\1m.facebook.com", url)
-    return url
 
 def extract_fb_uid(url: str) -> str:
+    """
+    Extracts the Post ID, Page UID, or Story ID from a Facebook URL.
+    Generates a deterministic fallback hash identifier if not directly extractable.
+    """
     clean_url = url.strip()
     parsed = urlparse(clean_url)
     qs = parse_qs(parsed.query)
 
-    for param in ("id", "story_fbid", "fbid", "v"):
+    # 1. Query parameters (story_fbid, fbid, id, v)
+    for param in ("story_fbid", "fbid", "v", "id"):
         if param in qs and qs[param]:
-            return str(qs[param][0]).strip()
+            val = qs[param][0].strip()
+            if val and val.isdigit():
+                return val
 
-    share_match = re.search(r"/share/[pvr]/([a-zA-Z0-9_-]+)", clean_url)
-    if share_match:
-        return share_match.group(1)
-
+    # 2. Path patterns:
+    # /posts/pfbid02xxxx
+    # /posts/123456789
+    # /permalink/123456789
+    # /watch/?v=123456789
+    # /reel/123456789
+    # /groups/group_id/posts/post_id
     patterns = [
-        r"/groups/[^/]+/permalink/([0-9]+)",
-        r"/groups/[^/]+/posts/([0-9]+)",
         r"/posts/(pfbid[0-9a-zA-Z]+)",
         r"/posts/([0-9]+)",
-        r"/reel/([0-9a-zA-Z_-]+)",
+        r"/permalink/([0-9]+)",
+        r"/reel/([0-9]+)",
         r"/videos/([0-9]+)",
         r"/photos/[^/]+/([0-9]+)",
+        r"/groups/[^/]+/permalink/([0-9]+)",
+        r"/groups/[^/]+/posts/([0-9]+)",
         r"fb\.watch/([a-zA-Z0-9_-]+)",
     ]
+
     for pat in patterns:
         m = re.search(pat, clean_url)
         if m:
             return m.group(1)
 
-    path_parts = [p for p in parsed.path.strip("/").split("/") if p and p not in ("pages", "profile.php", "share")]
+    # 3. Handle page / profile name if path exists
+    path_parts = [p for p in parsed.path.strip("/").split("/") if p and p not in ("pages", "profile.php")]
     if path_parts:
-        candidate = path_parts[0]
-        if re.match(r"^[0-9a-zA-Z._-]+$", candidate) and len(candidate) >= 3:
+        candidate = path_parts[-1]
+        # Only use alphanumeric candidate
+        if re.match(r"^[0-9a-zA-Z._-]+$", candidate) and len(candidate) >= 4:
             return candidate
 
+    # 4. Fallback: Short deterministic hash
     md5 = hashlib.md5(clean_url.encode("utf-8")).hexdigest()
-    return f"FB_{md5[:8]}"
+    return f"FB_{md5[:10]}"
+
+
+def extract_title_and_status(html: str, url: str) -> Tuple[bool, str, str]:
+    """
+    Parses HTML to determine whether the post is alive and extracts title/name.
+    Returns: (is_alive, reason, title)
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. Extract potential title from OpenGraph or <title>
+    title = ""
+    og_title = soup.find("meta", property="og:title")
+    if og_title and og_title.get("content"):
+        title = og_title["content"].strip()
+
+    if not title:
+        title_tag = soup.find("title")
+        if title_tag and title_tag.text:
+            title = title_tag.text.strip()
+
+    # Clean generic Facebook titles
+    if title:
+        title = re.sub(r"\s*\|\s*Facebook$", "", title, flags=re.I).strip()
+        title = re.sub(r"^Facebook\s*[-–—:]\s*", "", title, flags=re.I).strip()
+
+    # 2. Check for dead signatures in title
+    if title:
+        for pat in DEAD_PATTERNS:
+            if pat.search(title):
+                return False, f"Dead marker in page title: '{title}'", title or "Unknown"
+
+    # 3. Check for dead signatures in page body text
+    body_text = soup.get_text(separator=" ", strip=True)
+    for pat in DEAD_PATTERNS:
+        if pat.search(body_text):
+            return False, "Facebook content removal notice detected in page body", title or "Unknown"
+
+    # 4. Check for 'action-redirect' or checkpoint error
+    if "checkpoint/block" in html or "login.php?next=" in html and "privacy_mutation_token" in html:
+        return False, "Redirected to checkpoint/security barrier", title or "Unknown"
+
+    # 5. Fallback title if none found
+    if not title:
+        title = f"Facebook Post ({extract_fb_uid(url)})"
+
+    return True, "Content accessible", title
+
 
 async def check_facebook_link(
     url: str,
-    session: Optional[any] = None,
-    proxy_url: Optional[str] = None,
-    timeout_seconds: int = 20,
-    custom_user_agent: Optional[str] = None,
-    **kwargs
+    session: Optional[aiohttp.ClientSession] = None,
+    timeout_seconds: int = 15,
+    custom_user_agent: Optional[str] = None
 ) -> CheckResult:
-    target_url = normalize_facebook_url(url)
-    uid = extract_fb_uid(target_url)
+    """
+    Asynchronously checks Facebook link accessibility via HTTP request.
+    Handles redirects, status codes, and content inspection.
+    """
+    uid = extract_fb_uid(url)
+    should_close_session = False
 
-    # Resolve proxy if configured
-    proxy_config = None
-    active_proxy = proxy_url or os.getenv("PROXY_URL", "").strip()
-    if active_proxy:
-        proxy_config = {"server": active_proxy}
+    if session is None:
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        session = aiohttp.ClientSession(timeout=timeout)
+        should_close_session = True
 
-    context: Optional[BrowserContext] = None
+    headers = {
+        "User-Agent": custom_user_agent or random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "DNT": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
     try:
-        browser = await get_browser()
-        context = await browser.new_context(
-            user_agent=custom_user_agent or MOBILE_USER_AGENT,
-            viewport={"width": 412, "height": 915},
-            locale="en-US",
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
-            },
-            java_script_enabled=True,
-            proxy=proxy_config,
+        # Standardize URL
+        target_url = url.strip()
+        if not target_url.startswith(("http://", "https://")):
+            target_url = "https://" + target_url
+
+        async with session.get(
+            target_url,
+            headers=headers,
+            allow_redirects=True,
+            ssl=False
+        ) as resp:
+            status_code = resp.status
+            final_url = str(resp.url).lower()
+
+            # HTTP Error check
+            if status_code in (404, 410):
+                return CheckResult(
+                    is_alive=False,
+                    status="DEAD",
+                    reason=f"HTTP status code {status_code} (Not Found / Gone)",
+                    title=f"Facebook Post ({uid})",
+                    uid=uid,
+                    url=url,
+                    status_code=status_code,
+                )
+
+            # Redirect check to login or error
+            if any(term in final_url for term in [
+                "/login.php",
+                "/login/",
+                "checkpoint",
+                "/help/",
+                "?stype=lo",
+                "login/?next="
+            ]):
+                # If redirected to generic login without retaining original content context
+                # Often occurs when post is deleted or set to restricted
+                return CheckResult(
+                    is_alive=False,
+                    status="DEAD",
+                    reason="Redirected to Facebook login/checkpoint (Content removed or private)",
+                    title=f"Facebook Post ({uid})",
+                    uid=uid,
+                    url=url,
+                    status_code=status_code,
+                )
+
+            html = await resp.text(errors="ignore")
+            is_alive, reason, title = extract_title_and_status(html, url)
+
+            return CheckResult(
+                is_alive=is_alive,
+                status="ACTIVE" if is_alive else "DEAD",
+                reason=reason,
+                title=title,
+                uid=uid,
+                url=url,
+                status_code=status_code,
+            )
+
+    except aiohttp.ClientError as e:
+        logger.warning(f"Network error checking {url}: {e}")
+        return CheckResult(
+            is_alive=True,  # Don't falsely flag as dead on transient network glitches
+            status="ACTIVE",
+            reason=f"Network error (temporary): {type(e).__name__}",
+            title=f"Facebook Post ({uid})",
+            uid=uid,
+            url=url,
+            status_code=0,
         )
-
-        page = await context.new_page()
-
-        # ইমেজ/ফন্ট/মিডিয়া ব্লক করা যাতে দ্রুত লোড হয় এবং সার্ভার RAM বাঁচে
-        async def block_media(route):
-            if route.request.resource_type in ["image", "media", "font"]:
-                await route.abort()
-            else:
-                await route.continue_()
-
-        await page.route("**/*", block_media)
-
-        response = await page.goto(target_url, timeout=timeout_seconds * 1000, wait_until="domcontentloaded")
-        
-        # React DOM হাইড্রেশনের জন্য প্রয়োজনীয় সামান্য অপেক্ষা
-        await asyncio.sleep(1.5)
-
-        status_code = response.status if response else 200
-        final_url = page.url.lower()
-
-        # 1. HTTP 404/410 স্ট্যাটাস চেক
-        if status_code in (404, 410):
-            return CheckResult(
-                is_alive=False,
-                status="DEAD",
-                reason=f"HTTP Status {status_code} (Not Found)",
-                title=f"Deleted Content ({uid})",
-                uid=uid,
-                url=target_url,
-                status_code=status_code
-            )
-
-        # পেজের বডি টেক্সট ও টাইটেল সংগ্রহ
-        body_text = ""
-        try:
-            body_text = (await page.inner_text("body")).lower()
-        except Exception:
-            pass
-
-        page_title = await page.title()
-        clean_title = re.sub(r"\s*\|\s*Facebook$", "", page_title, flags=re.I).strip()
-        clean_title = re.sub(r"^Facebook\s*[- :]\s*", "", clean_title, flags=re.I).strip()
-
-        # 2. সরাসরি ডেড মার্কার চেক (DOM বডি এবং টাইটেলে)
-        for marker in DEFINITE_DEAD_MARKERS:
-            if marker in body_text or marker in clean_title.lower():
-                return CheckResult(
-                    is_alive=False,
-                    status="DEAD",
-                    reason=f"Dead signature verified in DOM: '{marker}'",
-                    title=f"Deleted Content ({uid})",
-                    uid=uid,
-                    url=target_url,
-                    status_code=status_code
-                )
-
-        # 3. ফেসবুক এরর কন্টেইনার বা চেকপয়েন্ট চেক
-        error_element = await page.query_selector('#m_error_page, [data-sigil="m_error_page"]')
-        if error_element is not None or "checkpoint/block" in final_url:
-            return CheckResult(
-                is_alive=False,
-                status="DEAD",
-                reason="Facebook error container rendered",
-                title=f"Deleted Content ({uid})",
-                uid=uid,
-                url=target_url,
-                status_code=status_code
-            )
-
-        # 4. OpenGraph মেটা ট্যাগ সংগ্রহ
-        og_title = await page.evaluate("""() => {
-            const el = document.querySelector('meta[property="og:title"]');
-            return el ? el.content : '';
-        }""")
-        og_desc = await page.evaluate("""() => {
-            const el = document.querySelector('meta[property="og:description"]');
-            return el ? el.content : '';
-        }""")
-
-        display_title = og_title or clean_title
-        display_title = re.sub(r"\s*\|\s*Facebook$", "", display_title, flags=re.I).strip()
-
-        # 5. লিঙ্ক যদি সরাসরি ব্ল্যাঙ্ক লগইন বা হোমপেজে রিডাইরেক্ট হয়ে যায় (পোস্ট মুছে যাওয়ার লক্ষণ)
-        is_generic_title = not display_title or display_title.lower() in GENERIC_LOGINS
-        is_generic_desc = not og_desc or og_desc.lower() in GENERIC_LOGINS
-
-        if is_generic_title and is_generic_desc:
-            if any(b in final_url for b in ["/login", "login.php", "checkpoint", "/home.php"]):
-                return CheckResult(
-                    is_alive=False,
-                    status="DEAD",
-                    reason="Redirected to login/home without target context (Content removed or private)",
-                    title=f"Deleted Content ({uid})",
-                    uid=uid,
-                    url=target_url,
-                    status_code=status_code
-                )
-
-        # 6. কনটেন্ট নিশ্চিতভাবে সচল (ACTIVE)
-        final_name = display_title if display_title.lower() not in GENERIC_LOGINS else (og_desc[:40] + "...")
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout checking {url}")
         return CheckResult(
             is_alive=True,
             status="ACTIVE",
-            reason="Verified active via Chromium DOM render",
-            title=final_name or f"Facebook ({uid})",
+            reason="Request timed out (temporary delay)",
+            title=f"Facebook Post ({uid})",
             uid=uid,
-            url=target_url,
-            status_code=status_code
+            url=url,
+            status_code=408,
         )
-
     except Exception as e:
-        logger.error(f"Browser check failed on {target_url}: {e}")
-        # নেটওয়ার্ক গ্লিচ বা সাময়িক রেন্ডারিং এরর হলে ভুল ফলস-অ্যালার্ট বন্ধ রাখতে ACTIVE বহাল
+        logger.error(f"Unexpected error checking {url}: {e}", exc_info=True)
         return CheckResult(
             is_alive=True,
             status="ACTIVE",
-            reason=f"Temporary render glitch: {type(e).__name__} (Preserved ACTIVE)",
-            title=f"Facebook ({uid})",
+            reason=f"Check exception: {str(e)}",
+            title=f"Facebook Post ({uid})",
             uid=uid,
-            url=target_url,
-            status_code=0
+            url=url,
+            status_code=500,
         )
     finally:
-        if context:
-            await context.close()
+        if should_close_session:
+            await session.close()

@@ -1,10 +1,5 @@
 """
-Facebook Post Monitor Telegram Bot (Production Ready)
-- Strict 5-Cycle Multi-Probe Link Verification
-- Direct DEAD Notification on Link Deletion
-- User Access Management & Admin Controls
-- Local Bangladesh Timezone Engine
-- Telegram Spoiler Tag Support
+Facebook Post Monitor Telegram Bot (Production Ready with Proxy Integration)
 """
 import os
 import re
@@ -33,7 +28,7 @@ from telegram.ext import (
     filters,
 )
 from database import Database
-from checker import check_facebook_link_deep, extract_fb_uid
+from checker import check_facebook_link, extract_fb_uid
 
 load_dotenv()
 
@@ -45,6 +40,7 @@ logger = logging.getLogger("FBMonitorBot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip()) if os.getenv("ADMIN_ID", "").strip().isdigit() else 0
+PROXY_URL = os.getenv("PROXY_URL", "").strip()
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "45"))
 REQUEST_DELAY_SECONDS = float(os.getenv("REQUEST_DELAY_SECONDS", "2.0"))
 MAX_CONCURRENT_CHECKS = int(os.getenv("MAX_CONCURRENT_CHECKS", "3"))
@@ -236,6 +232,7 @@ async def build_dead_message(link_data: dict, chat_id: int, is_hidden: bool = Fa
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
+# ================= Commands =================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await verify_user_access(update, context):
         return
@@ -248,15 +245,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         f"🚀 Welcome, <b>{html.escape(user.first_name)}</b>!\n\n"
         f"🔍 <b>Facebook Post & Link DIE Monitor</b>\n"
-        f"I track Facebook posts/profiles with deep multi-probe verification and alert you "
-        f"instantly when a post is removed or dies.\n\n"
-        f"📊 <b>Your Dashboard:</b>\n"
+        f"Equipped with Proxy Bypass Engine. I monitor your links and alert you instantly "
+        f"the moment a Facebook link is deleted or dies.\n\n"
+        f"📊 <b>Dashboard:</b>\n"
         f"• Total Links: <b>{stats['total']}</b>\n"
         f"• Active: <b>{stats['active']}</b>\n"
         f"• Dead: <b>{stats['dead']}</b>\n"
         f"• Stopped: <b>{stats['stopped']}</b>\n"
         f"• Timezone: <code>{user_tz}</code>\n\n"
-        f"Send any Facebook link to start monitoring:\n\n"
+        f"Send any Facebook link to monitor:\n\n"
         f"👑 <b>Owner:</b> <a href=\"https://t.me/tmmusa73\">—͞Tᴍ Mᴜsᴀ ⚡</a>"
     )
     keyboard = [
@@ -287,9 +284,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_states[user.id] = "AWAITING_LINKS"
     text = (
         "➕ <b>Add Links to Monitor</b>\n\n"
-        "Send one or multiple Facebook links to monitor.\n"
-        "The bot will perform a 5-cycle deep probe to verify link health.\n\n"
-        "Send /cancel at any time to abort."
+        "Send Facebook link(s) in your message (separated by line breaks or spaces).\n"
+        "Send /cancel to abort."
     )
     keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cmd_cancel")]]
     await update.message.reply_text(
@@ -407,11 +403,13 @@ async def cmd_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     stats = await db.get_stats(chat_id)
     _, tz_str = await get_user_now(chat_id)
 
+    proxy_status = "🟢 Active" if PROXY_URL else "⚪ Direct"
+
     text = (
         "🛠️ <b>Monitor Tools & Utilities:</b>\n\n"
         f"⏱️ <b>Scan Interval:</b> Every {CHECK_INTERVAL_SECONDS}s\n"
-        f"⏳ <b>Engine:</b> 5-Cycle Multi-Probe Scraper\n"
-        f"🌐 <b>Current Timezone:</b> <code>{tz_str}</code>\n"
+        f"🌐 <b>Proxy Engine:</b> {proxy_status}\n"
+        f"⏰ <b>Current Timezone:</b> <code>{tz_str}</code>\n"
         f"🟢 <b>Active Targets:</b> {stats['active']}\n"
         f"🔴 <b>Dead Detections:</b> {stats['dead']}\n"
     )
@@ -484,7 +482,7 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception:
         pass
 
-# ================= Message Processing with 5-Cycle Verification =================
+# ================= Message Processing =================
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await verify_user_access(update, context):
         return
@@ -523,7 +521,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         del user_states[user.id]
 
     status_msg = await update.message.reply_text(
-        f"⏳ Verifying {len(raw_urls)} Facebook link(s) across 5 probe cycles (Takes ~8-10 seconds for 100% accuracy)..."
+        f"⏳ Checking {len(raw_urls)} Facebook link(s)..."
     )
 
     async with aiohttp.ClientSession() as session:
@@ -533,8 +531,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 clean_url = "https://" + clean_url
 
             uid = extract_fb_uid(clean_url)
-            # Perform 5-cycle probe validation
-            check_result = await check_facebook_link_deep(clean_url, session=session, total_checks=5, delay_between_checks=1.5)
+            check_result = await check_facebook_link(clean_url, session=session, proxy_url=PROXY_URL)
 
             record = await db.add_link(
                 chat_id=chat_id,
@@ -754,7 +751,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         user_states[user.id] = "AWAITING_LINKS"
         text = (
             "➕ <b>Add Links to Monitor</b>\n\n"
-            "Paste one or multiple Facebook URLs in your next message.\n"
+            "Paste Facebook URLs in your next message.\n"
             "Send /cancel to abort."
         )
         keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cmd_cancel")]]
@@ -770,11 +767,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "cmd_tools":
         stats = await db.get_stats(chat_id)
         _, tz_str = await get_user_now(chat_id)
+        proxy_status = "🟢 Active" if PROXY_URL else "⚪ Direct"
         text = (
             "🛠️ <b>Monitor Tools & Utilities:</b>\n\n"
             f"⏱️ <b>Scan Interval:</b> Every {CHECK_INTERVAL_SECONDS}s\n"
-            f"⏳ <b>Verification Engine:</b> 5-Cycle Deep Probing\n"
-            f"🌐 <b>Current Timezone:</b> <code>{tz_str}</code>\n"
+            f"🌐 <b>Proxy Engine:</b> {proxy_status}\n"
+            f"⏰ <b>Current Timezone:</b> <code>{tz_str}</code>\n"
             f"🟢 <b>Active Targets:</b> {stats['active']}\n"
             f"🔴 <b>Dead Detections:</b> {stats['dead']}\n"
         )
@@ -790,7 +788,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "tools_check_now":
-        await query.answer("⚡ Running 5-cycle check on active links...", show_alert=True)
+        await query.answer("⚡ Running immediate check on active links...", show_alert=True)
         asyncio.create_task(run_single_monitoring_cycle(context.application, target_chat_id=chat_id))
         return
 
@@ -936,12 +934,11 @@ async def run_single_monitoring_cycle(app: Application, target_chat_id: Optional
                 chat_id = link_data["chat_id"]
                 url = link_data["url"]
 
-                # Background scan also uses deep 5-cycle check before triggering DEAD
-                result = await check_facebook_link_deep(url, session=session, total_checks=4, delay_between_checks=1.5)
+                result = await check_facebook_link(url, session=session, proxy_url=PROXY_URL)
                 await db.update_last_checked(link_id)
 
                 if not result.is_alive and result.status == "DEAD":
-                    logger.warning(f"Link {url} confirmed DEAD after 4 failed probes!")
+                    logger.warning(f"Link {url} confirmed DEAD via Proxy Engine!")
                     await db.update_status(link_id, status="DEAD", die_alert_sent=1)
                     updated_link = await db.get_link_by_id(link_id)
 
@@ -1017,7 +1014,7 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
 
-    logger.info("Bot started with 5-Cycle Multi-Probe Scraper...")
+    logger.info("Bot started with Proxy Engine...")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":

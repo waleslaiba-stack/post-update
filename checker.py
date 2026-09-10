@@ -29,7 +29,6 @@ MOBILE_UA = (
     "(KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36"
 )
 
-# Text phrases explicitly rendered ONLY when Facebook content is deleted/inaccessible
 DEFINITE_DEAD_MARKERS = [
     "this content isn't available right now",
     "the link you followed may be broken",
@@ -59,7 +58,6 @@ class CheckResult:
     status_code: int = 200
 
 def normalize_facebook_url(raw_url: str) -> str:
-    """Standardizes input URL."""
     url = raw_url.strip().rstrip(",.;!$*")
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -67,7 +65,7 @@ def normalize_facebook_url(raw_url: str) -> str:
         url = "https://" + url[7:]
     return url
 
-def extract_universal_fb_id(url: str) -> str:
+def extract_fb_uid(url: str) -> str:
     """Extracts identifier from profiles, posts, shares, reels, or queries."""
     clean_url = url.strip()
     parsed = urlparse(clean_url)
@@ -108,8 +106,10 @@ def extract_universal_fb_id(url: str) -> str:
     md5 = hashlib.md5(clean_url.encode("utf-8")).hexdigest()
     return f"FB_{md5[:8]}"
 
+# Backward compatibility alias
+extract_universal_fb_id = extract_fb_uid
+
 def extract_page_title(soup: BeautifulSoup, html_text: str) -> str:
-    """Attempts to find the authentic title/name of the profile or post."""
     og_title = soup.find("meta", property="og:title")
     if og_title and og_title.get("content"):
         t = og_title["content"].strip()
@@ -126,37 +126,30 @@ def extract_page_title(soup: BeautifulSoup, html_text: str) -> str:
     return ""
 
 async def evaluate_html_content(html_text: str, current_url: str) -> Tuple[bool, str, str]:
-    """Inspects Facebook page for genuine active content vs removal warnings."""
     lower_html = html_text.lower()
     curr_url_lower = current_url.lower()
 
-    # Rule 1: Check for definite removal signatures
     for marker in DEFINITE_DEAD_MARKERS:
         if marker in lower_html:
             return False, f"Dead content signature: '{marker}'", ""
 
-    # Rule 2: Check for checkpoint barrier or error container
     if "checkpoint/block" in curr_url_lower or 'id="m_error_page"' in html_text:
         return False, "Checkpoint/Error page barrier", ""
 
     soup = BeautifulSoup(html_text, "html.parser")
     title = extract_page_title(soup, html_text)
 
-    # If title itself says dead
     for marker in DEFINITE_DEAD_MARKERS:
         if marker in title.lower():
             return False, f"Dead indicator in title: '{title}'", ""
 
-    # Rule 3: OpenGraph & Canonical Verification
     og_desc = soup.find("meta", property="og:description")
     desc = og_desc.get("content", "").strip() if og_desc else ""
 
-    # If authentic title or description is present, it is 100% active
     if title or desc:
         final_name = title or (desc[:35] + "...")
         return True, "Authentic metadata verified", final_name
 
-    # If redirected to generic blank root domain without content
     og_url = soup.find("meta", property="og:url")
     if og_url and og_url.get("content"):
         u = og_url["content"].strip().lower()
@@ -172,7 +165,7 @@ async def check_facebook_link(
     custom_user_agent: Optional[str] = None
 ) -> CheckResult:
     target_url = normalize_facebook_url(url)
-    uid = extract_universal_fb_id(target_url)
+    uid = extract_fb_uid(target_url)
     should_close_session = False
 
     if session is None:
@@ -181,7 +174,7 @@ async def check_facebook_link(
         should_close_session = True
 
     try:
-        # ================= PASS 1: Desktop Engine (Follows Share redirects) =================
+        # PASS 1: Desktop Engine
         desktop_headers = {
             "User-Agent": custom_user_agent or DESKTOP_UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -214,7 +207,6 @@ async def check_facebook_link(
                 html_text = await resp.text(errors="ignore")
                 is_alive, reason, title = await evaluate_html_content(html_text, final_url)
 
-                # If confirmed alive on Desktop Pass, return immediately
                 if is_alive:
                     return CheckResult(
                         is_alive=True,
@@ -228,8 +220,7 @@ async def check_facebook_link(
         except Exception as e:
             logger.warning(f"Pass 1 Desktop check encountered issue: {e}")
 
-        # ================= PASS 2: Mobile Engine (Lightweight Verification) =================
-        # Converts URL to mobile view which has lower bot-detection walls
+        # PASS 2: Mobile Engine
         mobile_target = re.sub(r"^(https?://)(?:www\.|web\.)facebook\.com", r"\1m.facebook.com", target_url)
         mobile_headers = {
             "User-Agent": MOBILE_UA,

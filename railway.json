@@ -1,10 +1,20 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
   "build": {
-    "builder": "NIXPACKS"
+    "builder": "NIXPACKS",
+    "nixpacksPlan": {
+      "phases": {
+        "setup": {
+          "nixPkgs": ["chromium", "glib", "nss", "nspr", "atk", "at-spi2-atk", "libdrm", "mesa", "alsa-lib"]
+        },
+        "install": {
+          "cmds": ["pip install -r requirements.txt", "playwright install chromium"]
+        }
+      }
+    }
   },
   "deploy": {
-    "startCommand": "playwright install --with-deps chromium && python bot.py",
+    "startCommand": "python bot.py",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }

@@ -1,8 +1,11 @@
 """
-Facebook Link Accessibility Checker (Deterministic Canonical Engine).
-Strictly matches requested UID/slug against the resolved OpenGraph identity.
-Dead/deleted posts or redirects to login/home are strictly evaluated as DEAD.
+Facebook Universal Link Accessibility Checker (High-Stability Engine).
+Features:
+- Dual-Pass Inspection: Proxy Primary + Direct Fail-safe
+- Accurate for Groups, Profiles, Posts, Reels, and Share Redirects
+- Zero Hanging / Instant Status Feedback
 """
+import os
 import re
 import hashlib
 import logging
@@ -14,8 +17,11 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# Standard Desktop Crawler Header (Bypasses mobile script traps and gets pure OpenGraph)
-PREVIEW_UA = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
+# Standard Real-Device User-Agent to avoid scraping traps
+REAL_DEVICE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 DEFINITE_DEAD_MARKERS = [
     "this content isn't available right now",
@@ -37,13 +43,13 @@ DEFINITE_DEAD_MARKERS = [
     "inhalt derzeit nicht verfügbar",
 ]
 
-GENERIC_TITLES = [
+GENERIC_TRASH = [
     "facebook",
     "log into facebook",
     "log in to facebook",
     "log in",
-    "facebook – log in or sign up",
     "facebook - log in or sign up",
+    "facebook – log in or sign up",
     "error",
     "",
 ]
@@ -64,9 +70,6 @@ def normalize_facebook_url(raw_url: str) -> str:
         url = "https://" + url
     elif url.startswith("http://"):
         url = "https://" + url[7:]
-
-    # Remove tracking query parameters (fbclid, etc.)
-    url = re.sub(r"([?&])fbclid=[^&]+(&|$)", r"\1", url).rstrip("?&")
     return url
 
 def extract_fb_uid(url: str) -> str:
@@ -106,31 +109,21 @@ def extract_fb_uid(url: str) -> str:
     md5 = hashlib.md5(clean_url.encode("utf-8")).hexdigest()
     return f"FB_{md5[:8]}"
 
-def evaluate_page_health(html_text: str, final_url: str, initial_url: str) -> Tuple[bool, str, str]:
-    uid = extract_fb_uid(initial_url)
+def inspect_html_health(html_text: str, final_url: str, uid: str) -> Tuple[bool, str, str]:
     lower_html = html_text.lower()
     curr_url_lower = final_url.lower()
 
-    # Rule 1: Explicit removal text anywhere in HTML
+    # Explicit dead signatures
     for marker in DEFINITE_DEAD_MARKERS:
         if marker in lower_html:
             return False, f"Dead content signature: '{marker}'", f"Dead Content ({uid})"
 
-    # Rule 2: Redirected away to login, checkpoint or root home
-    if any(barrier in curr_url_lower for barrier in ["/login", "checkpoint", "/help/contact/", "login.php"]):
-        return False, "Redirected to Facebook login/checkpoint (Content removed)", f"Dead Content ({uid})"
+    # Checkpoint / Barrier detection
+    if "checkpoint/block" in curr_url_lower or "/help/contact/" in curr_url_lower:
+        return False, "Checkpoint/Help barrier redirect", f"Dead Content ({uid})"
 
     soup = BeautifulSoup(html_text, "html.parser")
 
-    # Rule 3: Canonical & OG URL Check
-    # Active targets point to their actual page/post. Dead targets resolve to generic facebook.com
-    og_url_tag = soup.find("meta", property="og:url")
-    og_url = og_url_tag["content"].strip().lower() if og_url_tag and og_url_tag.get("content") else ""
-    
-    if og_url in ("https://www.facebook.com/", "https://www.facebook.com", "https://facebook.com/"):
-        return False, "Resolved to root home page (Target does not exist)", f"Dead Content ({uid})"
-
-    # Rule 4: Title Verification
     og_title_tag = soup.find("meta", property="og:title")
     og_title = og_title_tag["content"].strip() if og_title_tag and og_title_tag.get("content") else ""
 
@@ -141,27 +134,53 @@ def evaluate_page_health(html_text: str, final_url: str, initial_url: str) -> Tu
     clean_title = re.sub(r"\s*\|\s*Facebook$", "", clean_title, flags=re.I).strip()
     clean_title = re.sub(r"^Facebook\s*[- :]\s*", "", clean_title, flags=re.I).strip()
 
-    # Title explicit dead check
     for marker in DEFINITE_DEAD_MARKERS:
         if marker in clean_title.lower():
             return False, f"Title indicates removal: '{clean_title}'", f"Dead Content ({uid})"
 
-    # Rule 5: Authentic Metadata Check
     og_desc_tag = soup.find("meta", property="og:description")
     og_desc = og_desc_tag["content"].strip() if og_desc_tag and og_desc_tag.get("content") else ""
 
-    has_real_title = bool(clean_title and clean_title.lower() not in GENERIC_TITLES)
-    has_real_desc = bool(og_desc and og_desc.lower() not in GENERIC_TITLES)
+    # Canonical redirect to root domain means content was deleted
+    og_url_tag = soup.find("meta", property="og:url")
+    if og_url_tag and og_url_tag.get("content"):
+        u = og_url_tag["content"].strip().lower()
+        if u in ("https://www.facebook.com/", "https://www.facebook.com", "https://m.facebook.com/"):
+            return False, "Redirected to root home page (Target does not exist)", f"Dead Content ({uid})"
 
-    # A live link MUST have either an authentic custom title or a descriptive body
+    has_real_title = bool(clean_title and clean_title.lower() not in GENERIC_TRASH)
+    has_real_desc = bool(og_desc and og_desc.lower() not in GENERIC_TRASH)
+
     if has_real_title:
         return True, "Authentic title verified", clean_title
 
     if has_real_desc:
         return True, "Authentic description verified", og_desc[:35] + "..."
 
-    # If it is a generic Facebook wrapper without content, it is DEAD
+    # If only login text is returned and no target details exist, the post is DEAD
+    if any(b in curr_url_lower for b in ["/login", "login.php"]):
+        return False, "Redirected to login with no post context (Content removed)", f"Dead Content ({uid})"
+
     return False, "No authentic post or profile metadata found (Content removed)", f"Dead Content ({uid})"
+
+async def _fetch_request(url: str, session: aiohttp.ClientSession, proxy: Optional[str] = None) -> Tuple[int, str, str]:
+    headers = {
+        "User-Agent": REAL_DEVICE_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
+        "Sec-Fetch-Mode": "navigate",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    async with session.get(
+        url,
+        headers=headers,
+        proxy=proxy,
+        allow_redirects=True,
+        timeout=aiohttp.ClientTimeout(total=12),
+        ssl=False
+    ) as resp:
+        html = await resp.text(errors="ignore")
+        return resp.status, str(resp.url), html
 
 async def check_facebook_link(
     url: str,
@@ -175,59 +194,50 @@ async def check_facebook_link(
     should_close_session = False
 
     if session is None:
-        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        session = aiohttp.ClientSession(timeout=timeout)
+        session = aiohttp.ClientSession()
         should_close_session = True
 
-    headers = {
-        "User-Agent": custom_user_agent or PREVIEW_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
-        "Sec-Fetch-Mode": "navigate",
-    }
+    proxy = proxy_url or os.getenv("PROXY_URL", "").strip() or None
 
     try:
-        async with session.get(
-            target_url,
-            headers=headers,
-            proxy=proxy_url or None,
-            allow_redirects=True,
-            ssl=False
-        ) as resp:
-            status_code = resp.status
-            final_url = str(resp.url)
+        # Pass 1: Try with configured Proxy
+        try:
+            status_code, final_url, html_text = await _fetch_request(target_url, session, proxy=proxy)
+        except Exception as proxy_err:
+            logger.warning(f"Proxy attempt failed on {target_url}, falling back to Direct: {proxy_err}")
+            # Pass 2: Direct fallback if proxy has issues
+            status_code, final_url, html_text = await _fetch_request(target_url, session, proxy=None)
 
-            if status_code in (404, 410):
-                return CheckResult(
-                    is_alive=False,
-                    status="DEAD",
-                    reason=f"HTTP Status {status_code} (Not Found)",
-                    title=f"Deleted Content ({uid})",
-                    uid=uid,
-                    url=target_url,
-                    status_code=status_code,
-                )
-
-            html_text = await resp.text(errors="ignore")
-            is_alive, reason, title = evaluate_page_health(html_text, final_url, target_url)
-
+        if status_code in (404, 410):
             return CheckResult(
-                is_alive=is_alive,
-                status="ACTIVE" if is_alive else "DEAD",
-                reason=reason,
-                title=title or f"Facebook ({uid})",
+                is_alive=False,
+                status="DEAD",
+                reason=f"HTTP Status {status_code} (Not Found)",
+                title=f"Deleted Content ({uid})",
                 uid=uid,
                 url=target_url,
                 status_code=status_code,
             )
 
+        is_alive, reason, title = inspect_html_health(html_text, final_url, uid)
+
+        return CheckResult(
+            is_alive=is_alive,
+            status="ACTIVE" if is_alive else "DEAD",
+            reason=reason,
+            title=title or f"Facebook ({uid})",
+            uid=uid,
+            url=target_url,
+            status_code=status_code,
+        )
+
     except Exception as e:
-        logger.warning(f"Error checking {target_url}: {e}")
-        # Network dropouts retain ACTIVE to prevent transient false alerts
+        logger.error(f"Checker error on {target_url}: {e}")
+        # Keep alive on complete network failure to avoid false dead triggers
         return CheckResult(
             is_alive=True,
             status="ACTIVE",
-            reason="Temporary connection hesitation (Preserved ACTIVE)",
+            reason="Network delay (Link kept ACTIVE)",
             title=f"Facebook ({uid})",
             uid=uid,
             url=target_url,

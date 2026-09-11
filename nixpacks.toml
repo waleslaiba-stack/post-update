@@ -1,0 +1,43 @@
+# nixpacks.toml — Used by Railway if Dockerfile is not detected or as fallback
+# This config ensures Playwright/Chromium dependencies are installed at build time.
+
+[phases.setup]
+nixPkgs = [
+  "python311",
+  "glib",
+  "nss",
+  "nspr",
+  "atk",
+  "at-spi2-atk",
+  "cups",
+  "libdrm",
+  "dbus",
+  "expat",
+  "libxcb",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "xorg.libxkbcommon",
+  "mesa",
+  "pango",
+  "cairo",
+  "alsa-lib",
+  "at-spi2-core",
+  "fontconfig",
+  "freetype",
+  "xorg.libX11",
+  "xorg.libXcursor",
+  "xorg.libXi",
+  "xorg.libXtst",
+]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "python -m playwright install chromium",
+]
+
+[start]
+cmd = "python bot.py"

@@ -1,578 +1,1013 @@
 """
-Facebook Content Health Monitor - Telegram Bot
-
-Monitors your OWN Facebook objects (pages, posts, videos...) via the official
-Graph API and alerts you the moment one becomes inaccessible. See README.md
-for setup (you must supply your own long-lived FB_ACCESS_TOKEN).
+bot.py — Facebook Link Health Monitor Telegram Bot
+python-telegram-bot v21 (async) + Playwright + aiosqlite
 """
+
+from __future__ import annotations
+
+import os
+import re
 import asyncio
 import logging
-from datetime import datetime
-from html import escape as h
-from typing import Optional
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List, Dict, Any
 
-import aiohttp
 import pytz
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from dotenv import load_dotenv
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
+    ApplicationBuilder,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
     filters,
 )
+from telegram.error import TelegramError, BadRequest
 
-import config
 import database as db
-import graph_checker
+from checker import check_facebook_link, is_facebook_url, normalise_facebook_url
+
+load_dotenv()
+
+# Configuration
+BOT_TOKEN    = os.environ["BOT_TOKEN"]
+ADMIN_ID     = int(os.environ["ADMIN_ID"])
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "50"))  # seconds
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger("fb-monitor-bot")
+logger = logging.getLogger(__name__)
 
-# Per-chat state for the tiny "waiting for a note" conversation step.
-# {chat_id: object_id_awaiting_note}
-_AWAITING_NOTE: dict[int, int] = {}
+# Timezone options
+TIMEZONES: Dict[str, str] = {
+    "Asia/Dhaka":     "🇧🇩 Bangladesh (UTC+6)",
+    "Asia/Kolkata":   "🇮🇳 India (UTC+5:30)",
+    "Asia/Riyadh":    "🇸🇦 Saudi Arabia (UTC+3)",
+    "Asia/Dubai":     "🇦🇪 UAE (UTC+4)",
+    "Europe/London":  "🇬🇧 UK (GMT/BST)",
+    "America/New_York": "🇺🇸 US Eastern",
+    "America/Los_Angeles": "🇺🇸 US Pacific",
+    "UTC":            "🌐 UTC",
+}
 
-MAIN_MENU_TEXT = (
-    "🤖 <b>Facebook Content Health Monitor</b>\n\n"
-    "Send me a Facebook URL, page username, or numeric object ID and I'll "
-    "start monitoring it for you. I'll alert you the moment it becomes "
-    "inaccessible.\n\n"
-    '👑 Owner: <a href="https://t.me/tmmusa73">—͞Tᴍ Mᴜsᴀ ⚡</a>'
-)
-
-
-# ---------------------------------------------------------------------------
-# Helpers: access control, time formatting
-# ---------------------------------------------------------------------------
-
-async def _ensure_approved(update: Update) -> Optional["db.TrackedUser"]:
-    """Registers the user if new, and returns them if approved, else None
-    (after sending the appropriate pending/rejected message)."""
-    tg_user = update.effective_user
-    user = await db.get_or_create_user(tg_user.id, tg_user.first_name or "", tg_user.username)
-
-    if user.status == "APPROVED":
-        return user
-
-    if user.status == "PENDING":
-        await update.effective_message.reply_text(
-            "⏳ Your access request is pending admin approval. You'll be notified once approved."
-        )
-        await _notify_admin_new_user(update, tg_user.id)
-        return None
-
-    await update.effective_message.reply_text("🚫 You do not have access to this bot.")
-    return None
+# Conversation states
+EDIT_NAME, EDIT_NOTE = range(2)
+BROADCAST_MSG = 10
 
 
-async def _notify_admin_new_user(update: Update, user_id: int) -> None:
-    """Sends (or re-sends) the approve/reject prompt to the admin for a pending user."""
-    tg_user = update.effective_user
-    keyboard = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("🟢 Approve", callback_data=f"admin_approve:{user_id}"),
-            InlineKeyboardButton("🔴 Reject", callback_data=f"admin_reject:{user_id}"),
-        ]]
-    )
-    text = (
-        f"🆕 <b>New access request</b>\n"
-        f"Name: {h(tg_user.first_name or '')}\n"
-        f"Username: @{h(tg_user.username) if tg_user.username else 'N/A'}\n"
-        f"User ID: <code>{user_id}</code>"
-    )
-    try:
-        await update.get_bot().send_message(
-            config.ADMIN_ID, text, reply_markup=keyboard, parse_mode=ParseMode.HTML
-        )
-    except Exception:
-        logger.exception("Failed to notify admin of new user %s", user_id)
-
-
-def _fmt_time(ts: Optional[int], tz_name: str) -> str:
-    if not ts:
+# Helper: format time in user's timezone
+def fmt_time(iso_str: Optional[str], tz_name: str = "Asia/Dhaka") -> str:
+    if not iso_str:
         return "N/A"
-    tz = pytz.timezone(tz_name)
-    dt = datetime.fromtimestamp(ts, tz)
-    return dt.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    try:
+        dt = datetime.fromisoformat(iso_str).replace(tzinfo=timezone.utc)
+        tz = pytz.timezone(tz_name)
+        local = dt.astimezone(tz)
+        return local.strftime("%d %b %Y, %I:%M %p")
+    except Exception:
+        return iso_str
 
 
-def _fmt_duration(seconds: int) -> str:
-    minutes, secs = divmod(max(seconds, 0), 60)
-    hours, minutes = divmod(minutes, 60)
-    parts = []
-    if hours:
-        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
-    if minutes:
-        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
-    parts.append(f"{secs} second{'s' if secs != 1 else ''}")
-    return " ".join(parts)
+def calc_duration(created: Optional[str], updated: Optional[str]) -> str:
+    if not created or not updated:
+        return "N/A"
+    try:
+        c = datetime.fromisoformat(created)
+        u = datetime.fromisoformat(updated)
+        diff = u - c
+        total_seconds = int(diff.total_seconds())
+        if total_seconds < 0:
+            total_seconds = 0
+        hours, rem = divmod(total_seconds, 3600)
+        mins, secs = divmod(rem, 60)
+        parts = []
+        if hours:
+            parts.append(f"{hours}h")
+        if mins:
+            parts.append(f"{mins}m")
+        parts.append(f"{secs}s")
+        return " ".join(parts) if parts else "0s"
+    except Exception:
+        return "N/A"
 
 
-# ---------------------------------------------------------------------------
-# Card rendering
-# ---------------------------------------------------------------------------
+# Access control decorator
+def require_approved(handler):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not user:
+            return
+        record = await db.get_user(user.id)
+        if not record:
+            # Auto-register and notify admin
+            await db.upsert_user(user.id, user.first_name, user.username)
+            await notify_admin_new_user(context, user.id, user.first_name, user.username)
+            await update.effective_message.reply_text(
+                "⏳ **Access Pending**\n\n"
+                "Your access request has been sent to the admin.\n"
+                "You'll be notified once approved.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if record["status"] == "PENDING":
+            await update.effective_message.reply_text(
+                "⏳ **Still Pending**\n\nYour request is under review.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if record["status"] in ("REJECTED", "BLOCKED"):
+            await update.effective_message.reply_text(
+                "🚫 **Access Denied**\n\nYou are not authorised to use this bot.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        return await handler(update, context)
+    return wrapper
 
-def _spoiler(text: str, hidden: bool) -> str:
-    text = h(text)
-    return f"<tg-spoiler>{text}</tg-spoiler>" if hidden else text
+
+async def notify_admin_new_user(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    first_name: str,
+    username: Optional[str],
+) -> None:
+    uname = f"@{username}" if username else "No username"
+    text = (
+        f"🔔 **New Access Request**\n\n"
+        f"👤 User ID: `{user_id}`\n"
+        f"📛 Name: **{first_name}**\n"
+        f"🏷 Username: {uname}\n\n"
+        f"Grant access?"
+    )
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"admin_approve:{user_id}"),
+            InlineKeyboardButton("❌ Reject",  callback_data=f"admin_reject:{user_id}"),
+        ]
+    ])
+    try:
+        await context.bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except TelegramError as e:
+        logger.error("Failed to notify admin: %s", e)
 
 
-def render_active_card(obj: "db.TrackedObject", tz_name: str) -> str:
-    name = _spoiler(obj.name or "Unknown", obj.is_hidden)
-    note = _spoiler(obj.note or "None", obj.is_hidden)
-    uid = _spoiler(obj.object_id, obj.is_hidden)
-    link = h(obj.url or obj.object_id)
+# Card builders
+def active_card(link: Dict, tz_name: str = "Asia/Dhaka") -> str:
     return (
-        f"🔔 UID: {uid} - <a href=\"{link}\">Open</a>\n"
-        f"🟢 Status: ACTIVE ✅\n"
-        f"👤 Name: {name}\n"
-        f"📝 Note: {note}\n"
-        f"⏱️ Created Time: {_fmt_time(obj.created_at, tz_name)}\n"
-        f"🔄 Progress: Monitoring, waiting for DIE ❌"
+        f"🔹 **UID:** `{link['uid']}`\n"
+        f"🟢 **Status:** ACTIVE\n"
+        f"📌 **Name:** {_esc(link.get('name') or 'N/A')}\n"
+        f"🔗 **URL:** {link['url']}\n"
+        f"📝 **Note:** {_esc(link.get('note') or '—')}\n"
+        f"📅 **Created:** {fmt_time(link.get('created_at'), tz_name)}\n"
+        f"⏳ **Progress:** Monitoring, waiting for DIE 🔴"
     )
 
 
-def render_dead_card(obj: "db.TrackedObject", tz_name: str) -> str:
-    name = _spoiler(obj.name or "Unknown", obj.is_hidden)
-    note = _spoiler(obj.note or "None", obj.is_hidden)
-    uid = _spoiler(obj.object_id, obj.is_hidden)
-    elapsed = _fmt_duration((obj.updated_at or obj.created_at) - obj.created_at)
+def dead_card(link: Dict, tz_name: str = "Asia/Dhaka", spoiler: bool = False) -> str:
+    uid_val  = f"`{link['uid']}`"
+    name_val = _esc(link.get("name") or "N/A")
+    note_val = _esc(link.get("note") or "—")
+    if spoiler:
+        uid_val  = f"{uid_val}"
+        name_val = f"{name_val}"
+        note_val = f"{note_val}"
+    duration = calc_duration(link.get("created_at"), link.get("updated_at"))
     return (
-        f"🔔 UID: {uid}\n"
-        f"🔴 Status: DEAD ❌\n"
-        f"👤 Name: {name}\n"
-        f"📝 Note: {note}\n"
-        f"⏱️ Created: {_fmt_time(obj.created_at, tz_name)}\n"
-        f"⏰ Updated: {_fmt_time(obj.updated_at, tz_name)}\n"
-        f"⏳ Processing Time: {elapsed}"
+        f"⚠️ **LINK DIED!**\n\n"
+        f"🔹 **UID:** {uid_val}\n"
+        f"🔴 **Status:** DEAD\n"
+        f"📌 **Name:** {name_val}\n"
+        f"🔗 **URL:** {link['url']}\n"
+        f"📝 **Note:** {note_val}\n"
+        f"📅 **Created:** {fmt_time(link.get('created_at'), tz_name)}\n"
+        f"⏱ **Updated:** {fmt_time(link.get('updated_at'), tz_name)}\n"
+        f"⏳ **Processing Time:** {duration}"
     )
 
 
-def active_card_keyboard(obj_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def stopped_card(link: Dict, tz_name: str = "Asia/Dhaka") -> str:
+    return (
+        f"🔹 **UID:** `{link['uid']}`\n"
+        f"⏸ **Status:** STOPPED\n"
+        f"📌 **Name:** {_esc(link.get('name') or 'N/A')}\n"
+        f"🔗 **URL:** {link['url']}\n"
+        f"📝 **Note:** {_esc(link.get('note') or '—')}\n"
+        f"📅 **Created:** {fmt_time(link.get('created_at'), tz_name)}\n"
+        f"⏱ **Updated:** {fmt_time(link.get('updated_at'), tz_name)}"
+    )
+
+
+def _esc(text: str) -> str:
+    """Minimal HTML escape for display text."""
+    return (
+        str(text)
+        .replace("&", "&")
+        .replace("<", "<")
+        .replace(">", ">")
+    )
+
+
+def active_card_buttons(link_uid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
         [
-            [
-                InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{obj_id}"),
-                InlineKeyboardButton("📋 List", callback_data="list:0"),
-            ],
-            [InlineKeyboardButton("🏠 Main Menu", callback_data="menu")],
-        ]
-    )
+            InlineKeyboardButton("✏️ Edit",    callback_data=f"edit:{link_uid}"),
+            InlineKeyboardButton("📋 List",    callback_data="list:1"),
+        ],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+    ])
 
 
-def dead_card_keyboard(obj_id: int, hidden: bool) -> InlineKeyboardMarkup:
-    hide_btn = (
-        InlineKeyboardButton("🐵 Show Info", callback_data=f"show:{obj_id}")
-        if hidden
-        else InlineKeyboardButton("🙈 Hide Info", callback_data=f"hide:{obj_id}")
-    )
-    return InlineKeyboardMarkup(
+def dead_card_buttons(link_uid: str, is_hidden: bool) -> InlineKeyboardMarkup:
+    hide_label = "👁 Show Info" if is_hidden else "🙈 Hide Info"
+    return InlineKeyboardMarkup([
         [
-            [hide_btn],
-            [
-                InlineKeyboardButton("🟢 Continue", callback_data=f"continue:{obj_id}"),
-                InlineKeyboardButton("🔴 Stop", callback_data=f"stop:{obj_id}"),
-            ],
-        ]
-    )
-
-
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+            InlineKeyboardButton(hide_label, callback_data=f"toggle_hide:{link_uid}"),
+        ],
         [
-            [InlineKeyboardButton("📋 My Links", callback_data="list:0")],
-            [InlineKeyboardButton("🌐 Timezone", callback_data="tz_menu")],
-        ]
-    )
+            InlineKeyboardButton("🔄 Continue", callback_data=f"continue:{link_uid}"),
+            InlineKeyboardButton("🛑 Stop",     callback_data=f"stop:{link_uid}"),
+        ],
+    ])
 
 
-# ---------------------------------------------------------------------------
-# Command handlers
-# ---------------------------------------------------------------------------
-
+# /start
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = await _ensure_approved(update)
+    user = update.effective_user
     if not user:
         return
-    await update.effective_message.reply_text(
-        MAIN_MENU_TEXT, reply_markup=main_menu_keyboard(), parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
+    record = await db.upsert_user(user.id, user.first_name, user.username)
+    if record.get("status") == "PENDING":
+        await notify_admin_new_user(context, user.id, user.first_name, user.username)
+        await update.message.reply_text(
+            "⏳ **Welcome!**\n\n"
+            "Your access request has been sent to the admin.\n"
+            "You'll be notified once approved.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if record.get("status") in ("REJECTED", "BLOCKED"):
+        await update.message.reply_text("🚫 Access denied.", parse_mode=ParseMode.HTML)
+        return
+    await send_main_menu(update, context)
+
+
+async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    stats = await db.get_link_stats(user.id)
+    text = (
+        f"🤖 **FB Link Monitor**\n\n"
+        f"👋 Hello, **{_esc(user.first_name)}**!\n\n"
+        f"📊 **Your Stats:**\n"
+        f"  🟢 Active:  **{stats['active']}**\n"
+        f"  🔴 Dead:    **{stats['dead']}**\n"
+        f"  ⏸ Stopped: **{stats['stopped']}**\n"
+        f"  📁 Total:   **{stats['total']}**\n\n"
+        f"🔗 **Send any Facebook URL to start monitoring!**\n\n"
+        f"*Supported: Posts, Reels, Videos, Profiles, Groups, Share links*"
     )
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 My Links",    callback_data="list:1"),
+            InlineKeyboardButton("⚙️ Settings",    callback_data="settings"),
+        ],
+        [InlineKeyboardButton("❓ Help",           callback_data="help")],
+    ])
+    msg = update.message or (update.callback_query.message if update.callback_query else None)
+    if msg:
+        try:
+            await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            pass
+
+
+# URL message handler — add new link
+@require_approved
+async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+    urls = _extract_facebook_urls(text)
+    if not urls:
+        await update.message.reply_text(
+            "⚠️ Please send a valid Facebook URL.\n\n"
+            "Examples:\n"
+            "• facebook.com/someuser\n"
+            "• facebook.com/permalink/...\n"
+            "• facebook.com/share/p/...\n"
+            "• facebook.com/reel/..."
+        )
+        return
+
+    for url in urls:
+        await _process_single_url(update, context, url)
+
+
+def _extract_facebook_urls(text: str) -> List[str]:
+    """Extract all Facebook URLs from a message."""
+    pattern = r"https?://(?:www\.|m\.|mbasic\.)?facebook\.com/\S+"
+    found = re.findall(pattern, text)
+    bare = re.findall(r"(?:www\.)?facebook\.com/\S+", text)
+    results = []
+    seen = set()
+    for u in found + bare:
+        u = u.rstrip(".,;)")
+        if u not in seen:
+            seen.add(u)
+            results.append(u)
+    return results
+
+
+async def _process_single_url(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+) -> None:
+    user = update.effective_user
+    url = normalise_facebook_url(url)
+    processing_msg = await update.message.reply_text(
+        f"🔍 **Checking link...**\n`{url[:80]}`",
+        parse_mode=ParseMode.HTML,
+    )
+    result = await check_facebook_link(url)
+    record = await db.get_user(user.id)
+    tz_name = record.get("timezone", "Asia/Dhaka") if record else "Asia/Dhaka"
+
+    if result.status == "ACTIVE":
+        link = await db.create_link(
+            chat_id=user.id,
+            url=url,
+            name=result.name[:120] if result.name else "",
+            note="",
+            status="ACTIVE",
+        )
+        card_text = active_card(link, tz_name)
+        kb = active_card_buttons(link["uid"])
+        try:
+            await processing_msg.edit_text(card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            await update.message.reply_text(card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    elif result.status == "DEAD":
+        link = await db.create_link(
+            chat_id=user.id,
+            url=url,
+            name=result.name[:120] if result.name else "",
+            note="",
+            status="DEAD",
+        )
+        card_text = dead_card(link, tz_name, spoiler=False)
+        kb = dead_card_buttons(link["uid"], is_hidden=False)
+        try:
+            await processing_msg.edit_text(card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            await update.message.reply_text(card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    else:
+        # ERROR — transient, save as ACTIVE (anti-glitch protection)
+        link = await db.create_link(
+            chat_id=user.id,
+            url=url,
+            name="",
+            note="",
+            status="ACTIVE",
+        )
+        card_text = (
+            f"⚠️ **Verification inconclusive**\n\n"
+            f"The link has been saved as **ACTIVE** for monitoring.\n"
+            f"*Reason: {_esc(result.reason)}*\n\n"
+        ) + active_card(link, tz_name)
+        kb = active_card_buttons(link["uid"])
+        try:
+            await processing_msg.edit_text(card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            await update.message.reply_text(card_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# /list command
+@require_approved
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_link_list(update, context, page=1)
+
+
+async def _send_link_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    page: int = 1,
+    edit: bool = False,
+) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    record = await db.get_user(user.id)
+    tz_name = record.get("timezone", "Asia/Dhaka") if record else "Asia/Dhaka"
+    links, total = await db.get_links_for_user(user.id, page=page, per_page=5)
+    total_pages = max(1, (total + 4) // 5)
+
+    if not links:
+        text = "📭 **No links found.**\n\nSend a Facebook URL to start monitoring!"
+        kb   = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+    else:
+        lines = [f"📋 **My Links** — Page {page}/{total_pages} ({total} total)\n"]
+        for lnk in links:
+            status_icon = {"ACTIVE": "🟢", "DEAD": "🔴", "STOPPED": "⏸"}.get(lnk["status"], "⚪")
+            name = _esc(lnk.get("name") or lnk["url"][:40])
+            lines.append(
+                f"{status_icon} `{lnk['uid']}` — {name}\n"
+                f"    📅 {fmt_time(lnk.get('created_at'), tz_name)}"
+            )
+        text = "\n".join(lines)
+
+        nav_row: List[InlineKeyboardButton] = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"list:{page-1}"))
+        if page < total_pages:
+            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"list:{page+1}"))
+
+        link_rows = []
+        for lnk in links:
+            link_rows.append([
+                InlineKeyboardButton(f"🔍 {lnk['uid']}", callback_data=f"view:{lnk['uid']}"),
+            ])
+
+        kb_rows = link_rows
+        if nav_row:
+            kb_rows.append(nav_row)
+        kb_rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
+        kb = InlineKeyboardMarkup(kb_rows)
+
+    msg = None
+    if update.callback_query:
+        msg = update.callback_query.message
+    elif update.message:
+        msg = update.message
+
+    if edit and update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest:
+            pass
+    elif msg:
+        await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# /status command
+@require_approved
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /status ")
+        return
+    uid = args[0].upper()
+    link = await db.get_link_by_uid(uid)
+    if not link or link["chat_id"] != update.effective_user.id:
+        await update.message.reply_text("❌ Link not found.")
+        return
+    record = await db.get_user(update.effective_user.id)
+    tz_name = record.get("timezone", "Asia/Dhaka") if record else "Asia/Dhaka"
+    if link["status"] == "ACTIVE":
+        text = active_card(link, tz_name)
+        kb = active_card_buttons(link["uid"])
+    elif link["status"] == "DEAD":
+        text = dead_card(link, tz_name)
+        kb = dead_card_buttons(link["uid"], bool(link["is_hidden"]))
+    else:
+        text = stopped_card(link, tz_name)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# /delete command
+@require_approved
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /delete ")
+        return
+    uid = args[0].upper()
+    link = await db.get_link_by_uid(uid)
+    if not link or link["chat_id"] != update.effective_user.id:
+        await update.message.reply_text("❌ Link not found.")
+        return
+    await db.delete_link(link["id"])
+    await update.message.reply_text(f"🗑 Link `{uid}` deleted.", parse_mode=ParseMode.HTML)
+
+
+# Admin commands
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        return
+    text = (
+        "👑 **Admin Panel**\n\n"
+        "Commands:\n"
+        "/block <user_id> — Block a user\n"
+        "/unblock <user_id> — Unblock a user\n"
+        "/users — List all users\n"
+        "/broadcast — Broadcast a message\n"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Users", callback_data="admin_users:1")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != config.ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID:
         return
-    if not context.args:
-        await update.effective_message.reply_text("Usage: /block <user_id>")
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /block ")
         return
-    target = int(context.args[0])
-    await db.set_user_status(target, "REJECTED")
-    await update.effective_message.reply_text(f"🔴 User {target} blocked.")
+    try:
+        uid = int(args[0])
+        await db.set_user_status(uid, "BLOCKED")
+        await update.message.reply_text(f"🚫 User `{uid}` blocked.", parse_mode=ParseMode.HTML)
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
 
 
 async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != config.ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID:
         return
-    if not context.args:
-        await update.effective_message.reply_text("Usage: /unblock <user_id>")
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /unblock ")
         return
-    target = int(context.args[0])
-    await db.set_user_status(target, "APPROVED")
-    await update.effective_message.reply_text(f"🟢 User {target} unblocked/approved.")
+    try:
+        uid = int(args[0])
+        await db.set_user_status(uid, "APPROVED")
+        await update.message.reply_text(f"✅ User `{uid}` unblocked.", parse_mode=ParseMode.HTML)
+        try:
+            await context.bot.send_message(uid, "✅ Your access has been restored!")
+        except Exception:
+            pass
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
 
 
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != config.ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID:
         return
-    users = await db.list_all_users()
-    if not users:
-        await update.effective_message.reply_text("No users yet.")
-        return
-    lines = [
-        f"{'🟢' if u.status == 'APPROVED' else '🟡' if u.status == 'PENDING' else '🔴'} "
-        f"<code>{u.user_id}</code> @{h(u.username) if u.username else '-'} ({h(u.status)})"
-        for u in users
-    ]
-    await update.effective_message.reply_text(
-        "<b>Users</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML
-    )
+    await _send_user_list(update, context, page=1)
 
 
-# ---------------------------------------------------------------------------
-# Adding a new link (plain text message = "add this")
-# ---------------------------------------------------------------------------
+async def _send_user_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    page: int = 1,
+    edit: bool = False,
+) -> None:
+    users, total = await db.get_all_users(page=page, per_page=8)
+    total_pages = max(1, (total + 7) // 8)
+    STATUS_ICONS = {"APPROVED": "✅", "PENDING": "⏳", "REJECTED": "❌", "BLOCKED": "🚫"}
+    lines = [f"👥 **All Users** — Page {page}/{total_pages}\n"]
+    for u in users:
+        icon = STATUS_ICONS.get(u["status"], "⚪")
+        uname = f"@{u['username']}" if u.get("username") else "—"
+        lines.append(f"{icon} `{u['user_id']}` | {_esc(u['first_name'])} ({uname})")
+    text = "\n".join(lines)
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = await _ensure_approved(update)
-    if not user:
-        return
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"admin_users:{page-1}"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"admin_users:{page+1}"))
 
-    chat_id = update.effective_chat.id
-    text = update.effective_message.text.strip()
+    kb_rows = []
+    if nav_row:
+        kb_rows.append(nav_row)
+    kb_rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
+    kb = InlineKeyboardMarkup(kb_rows)
 
-    # If we're waiting for a note for a specific object, treat this as that.
-    if chat_id in _AWAITING_NOTE:
-        obj_id = _AWAITING_NOTE.pop(chat_id)
-        note = None if text.lower() in ("none", "-", "clear") else text
-        await db.set_note(obj_id, note or "None")
-        obj = await db.get_object(obj_id)
-        await _send_card_for(update.effective_message, obj, user.timezone)
-        return
-
-    urls = [t for t in text.split() if t]
-    if not urls:
-        return
-
-    for raw in urls:
-        await _add_and_report(update, context, raw, user.timezone)
-
-
-async def _add_and_report(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: str, tz_name: str) -> None:
-    object_id = graph_checker.extract_object_id(raw)
-    status_msg = await update.effective_message.reply_text(f"🔎 Checking {h(object_id)} ...", parse_mode=ParseMode.HTML)
-
-    async with aiohttp.ClientSession() as session:
-        result = await graph_checker.check_object(session, object_id)
-
-    if result.is_auth_error:
-        await status_msg.edit_text(
-            "⚠️ Facebook rejected our access token while checking this object "
-            f"(<code>{h(result.detail or 'auth error')}</code>). "
-            "Ask the bot owner to refresh FB_ACCESS_TOKEN.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if result.status == graph_checker.STATUS_UNKNOWN:
-        result_status = "ACTIVE"
-        name = object_id
-    elif result.status == graph_checker.STATUS_DEAD:
-        result_status = "DEAD"
-        name = result.name or object_id
+    if edit and update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest:
+            pass
     else:
-        result_status = "ACTIVE"
-        name = result.name or object_id
+        msg = update.message or (update.callback_query.message if update.callback_query else None)
+        if msg:
+            await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    obj = await db.add_object(
-        chat_id=update.effective_chat.id,
-        object_id=object_id,
-        url=raw,
-        name=name,
-        note=None,
-        status=result_status,
+
+# /settings
+@require_approved
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_settings(update, context)
+
+
+async def _send_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False) -> None:
+    user = update.effective_user
+    record = await db.get_user(user.id)
+    tz_name = record.get("timezone", "Asia/Dhaka") if record else "Asia/Dhaka"
+    tz_label = TIMEZONES.get(tz_name, tz_name)
+    text = (
+        f"⚙️ **Settings**\n\n"
+        f"🕒 **Timezone:** {tz_label}\n\n"
+        f"Select your timezone:"
     )
-    await status_msg.delete()
-    await _send_card_for(update.effective_message, obj, tz_name)
+    kb_rows = []
+    for tz_key, tz_display in TIMEZONES.items():
+        active_mark = " ✅" if tz_key == tz_name else ""
+        kb_rows.append([InlineKeyboardButton(tz_display + active_mark, callback_data=f"set_tz:{tz_key}")])
+    kb_rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
+    kb = InlineKeyboardMarkup(kb_rows)
 
-
-async def _send_card_for(message, obj: "db.TrackedObject", tz_name: str) -> None:
-    if obj.status == "DEAD":
-        await message.reply_text(
-            render_dead_card(obj, tz_name),
-            reply_markup=dead_card_keyboard(obj.id, obj.is_hidden),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+    if edit and update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest:
+            pass
     else:
-        await message.reply_text(
-            render_active_card(obj, tz_name),
-            reply_markup=active_card_keyboard(obj.id),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        msg = update.message or (update.callback_query.message if update.callback_query else None)
+        if msg:
+            await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-# ---------------------------------------------------------------------------
-# Listing / pagination
-# ---------------------------------------------------------------------------
+# /help
+@require_approved
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "📖 **How to use FB Link Monitor**\n\n"
+        "**Add a link:**\n"
+        "Simply send any Facebook URL to start monitoring.\n\n"
+        "**Commands:**\n"
+        "/start — Main menu\n"
+        "/list — View all your monitored links\n"
+        "/status <UID> — Check a specific link\n"
+        "/delete <UID> — Remove a link\n"
+        "/settings — Change timezone\n"
+        "/help — This message\n\n"
+        "**Supported URL types:**\n"
+        "• User profiles: facebook.com/username\n"
+        "• Profile IDs: facebook.com/profile.php?id=...\n"
+        "• Posts: facebook.com/.../posts/...\n"
+        "• Reels: facebook.com/reel/...\n"
+        "• Videos: facebook.com/watch?v=...\n"
+        "• Share links: facebook.com/share/p/... or /share/v/...\n"
+        "• Group posts: facebook.com/groups/.../permalink/...\n\n"
+        "**Status icons:**\n"
+        "• 🟢 ACTIVE — Link is live and being monitored\n"
+        "• 🔴 DEAD — Link has been removed/deleted\n"
+        "• ⏸ STOPPED — Monitoring paused\n\n"
+        "**Dead alert buttons:**\n"
+        "• 🙈 Hide Info — Mask UID/Name/Note with spoiler\n"
+        "• 👁 Show Info — Reveal hidden info\n"
+        "• 🔄 Continue — Resume monitoring (reset to ACTIVE)\n"
+        "• 🛑 Stop — Stop monitoring this link"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-PAGE_SIZE = 5
 
-
-async def _render_list(chat_id: int, page: int, tz_name: str) -> tuple[str, InlineKeyboardMarkup]:
-    objs = await db.list_objects_by_chat(chat_id)
-    if not objs:
-        return "📭 You aren't monitoring any links yet. Send me a Facebook URL to get started.", main_menu_keyboard()
-
-    total_pages = max(1, (len(objs) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-    chunk = objs[page * PAGE_SIZE: (page + 1) * PAGE_SIZE]
-
-    icon = {"ACTIVE": "🟢", "DEAD": "🔴", "STOPPED": "⏹️"}
-    lines = [f"📋 <b>Your Links</b> (page {page + 1}/{total_pages})\n"]
-    for o in chunk:
-        lines.append(f"{icon.get(o.status, '⚪')} #{o.id} — {h(o.name or o.object_id)} ({o.status})")
-
-    buttons = [[InlineKeyboardButton(f"#{o.id} details", callback_data=f"view:{o.id}")] for o in chunk]
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"list:{page - 1}"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"list:{page + 1}"))
-    if nav:
-        buttons.append(nav)
-    buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu")])
-
-    return "\n".join(lines), InlineKeyboardMarkup(buttons)
-
-
-# ---------------------------------------------------------------------------
-# Callback query handler (all inline buttons)
-# ---------------------------------------------------------------------------
-
+# Callback query router
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    data = query.data or ""
     await query.answer()
+    data = query.data or ""
+    user = update.effective_user
 
-    tg_user = update.effective_user
-    user = await db.get_user(tg_user.id)
+    # Admin approval
+    if data.startswith("admin_approve:"):
+        target_id = int(data.split(":")[1])
+        await db.set_user_status(target_id, "APPROVED")
+        await query.edit_message_text(
+            f"✅ User `{target_id}` has been **approved**.",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            await context.bot.send_message(
+                target_id,
+                "🎉 **Access Granted!**\n\nYou can now use the bot. Send /start to begin.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
 
-    if data.startswith("admin_approve:") or data.startswith("admin_reject:"):
-        if tg_user.id != config.ADMIN_ID:
+    if data.startswith("admin_reject:"):
+        target_id = int(data.split(":")[1])
+        await db.set_user_status(target_id, "REJECTED")
+        await query.edit_message_text(
+            f"❌ User `{target_id}` has been **rejected**.",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            await context.bot.send_message(
+                target_id,
+                "🚫 **Access Denied.**\n\nYour request was not approved.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    # Admin user list
+    if data.startswith("admin_users:"):
+        if user.id != ADMIN_ID:
             return
-        target_id = int(data.split(":", 1)[1])
-        if data.startswith("admin_approve:"):
-            await db.set_user_status(target_id, "APPROVED")
-            await query.edit_message_text("🟢 User approved.")
-            try:
-                await context.bot.send_message(target_id, "✅ You've been approved! Send /start to begin.")
-            except Exception:
-                pass
-        else:
-            await db.set_user_status(target_id, "REJECTED")
-            await query.edit_message_text("🔴 User rejected.")
+        page = int(data.split(":")[1])
+        await _send_user_list(update, context, page=page, edit=True)
         return
 
-    if not user or user.status != "APPROVED":
-        await query.edit_message_text("🚫 You do not have access to this bot.")
-        return
-
-    tz_name = user.timezone
-
-    if data == "menu":
-        await query.edit_message_text(
-            MAIN_MENU_TEXT, reply_markup=main_menu_keyboard(), parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        return
-
+    # List navigation
     if data.startswith("list:"):
-        page = int(data.split(":", 1)[1])
-        text, kb = await _render_list(update.effective_chat.id, page, tz_name)
-        await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        page = int(data.split(":")[1])
+        await _send_link_list(update, context, page=page, edit=True)
         return
 
-    if data == "tz_menu":
-        rows = [
-            [InlineKeyboardButton(label, callback_data=f"tz_set:{tzname}")]
-            for label, tzname in config.SUPPORTED_TIMEZONES.items()
-        ]
-        rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu")])
-        await query.edit_message_text("🌐 Choose your timezone:", reply_markup=InlineKeyboardMarkup(rows))
+    # Main menu
+    if data == "main_menu":
+        await send_main_menu(update, context)
         return
 
-    if data.startswith("tz_set:"):
-        tzname = data.split(":", 1)[1]
-        await db.set_user_timezone(tg_user.id, tzname)
-        await query.edit_message_text(f"✅ Timezone set to {h(tzname)}.", reply_markup=main_menu_keyboard())
+    # Help
+    if data == "help":
+        text = (
+            "📖 **How to use FB Link Monitor**\n\n"
+            "Send any Facebook URL to start monitoring.\n\n"
+            "Use /help for full instructions."
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
-    if ":" not in data:
-        return
-    action, obj_id_str = data.split(":", 1)
-    try:
-        obj_id = int(obj_id_str)
-    except ValueError:
-        return
-    obj = await db.get_object(obj_id)
-    if not obj or obj.chat_id != update.effective_chat.id:
-        await query.edit_message_text("⚠️ This link no longer exists.")
+    # Settings
+    if data == "settings":
+        await _send_settings(update, context, edit=True)
         return
 
-    if action == "view":
-        if obj.status == "DEAD":
-            await query.edit_message_text(
-                render_dead_card(obj, tz_name), reply_markup=dead_card_keyboard(obj.id, obj.is_hidden),
-                parse_mode=ParseMode.HTML,
-            )
+    if data.startswith("set_tz:"):
+        tz_key = data.split(":", 1)[1]
+        if tz_key in TIMEZONES:
+            await db.set_user_timezone(user.id, tz_key)
+            await _send_settings(update, context, edit=True)
+        return
+
+    # View link detail
+    if data.startswith("view:"):
+        uid = data.split(":")[1]
+        link = await db.get_link_by_uid(uid)
+        if not link or link["chat_id"] != user.id:
+            await query.answer("Link not found.", show_alert=True)
+            return
+        record = await db.get_user(user.id)
+        tz_name = record.get("timezone", "Asia/Dhaka") if record else "Asia/Dhaka"
+        if link["status"] == "ACTIVE":
+            text = active_card(link, tz_name)
+            kb = active_card_buttons(link["uid"])
+        elif link["status"] == "DEAD":
+            text = dead_card(link, tz_name, spoiler=bool(link["is_hidden"]))
+            kb = dead_card_buttons(link["uid"], bool(link["is_hidden"]))
         else:
-            await query.edit_message_text(
-                render_active_card(obj, tz_name), reply_markup=active_card_keyboard(obj.id),
-                parse_mode=ParseMode.HTML,
-            )
+            text = stopped_card(link, tz_name)
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Resume", callback_data=f"continue:{uid}")],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+            ])
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest:
+            pass
         return
 
-    if action == "edit":
-        _AWAITING_NOTE[update.effective_chat.id] = obj.id
-        await query.edit_message_text(
-            f"✏️ Send the new note for <code>{h(obj.object_id)}</code> (or 'none' to clear).",
-            parse_mode=ParseMode.HTML,
+    # Edit link
+    if data.startswith("edit:"):
+        uid = data.split(":")[1]
+        link = await db.get_link_by_uid(uid)
+        if not link or link["chat_id"] != user.id:
+            await query.answer("Link not found.", show_alert=True)
+            return
+        context.user_data["editing_uid"] = uid
+        text = (
+            f"✏️ **Edit Link** `{uid}`\n\n"
+            f"Current Name: {_esc(link.get('name') or '—')}\n"
+            f"Current Note: {_esc(link.get('note') or '—')}\n\n"
+            f"Reply with: `Name | Note`\n"
+            f"Example: `My Post | Birthday video`\n\n"
+            f"Send /cancel to abort."
         )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"view:{uid}")]])
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
-    if action == "hide":
-        await db.set_object_hidden(obj.id, True)
-        obj = await db.get_object(obj.id)
-        await query.edit_message_text(
-            render_dead_card(obj, tz_name), reply_markup=dead_card_keyboard(obj.id, obj.is_hidden),
-            parse_mode=ParseMode.HTML,
-        )
+    # Toggle hide/show
+    if data.startswith("toggle_hide:"):
+        uid = data.split(":")[1]
+        link = await db.get_link_by_uid(uid)
+        if not link or link["chat_id"] != user.id:
+            await query.answer("Link not found.", show_alert=True)
+            return
+        new_hidden = not bool(link["is_hidden"])
+        await db.set_link_hidden(link["id"], new_hidden)
+        link = await db.get_link_by_uid(uid)
+        record = await db.get_user(user.id)
+        tz_name = record.get("timezone", "Asia/Dhaka") if record else "Asia/Dhaka"
+        text = dead_card(link, tz_name, spoiler=new_hidden)
+        kb   = dead_card_buttons(uid, new_hidden)
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest:
+            pass
         return
 
-    if action == "show":
-        await db.set_object_hidden(obj.id, False)
-        obj = await db.get_object(obj.id)
-        await query.edit_message_text(
-            render_dead_card(obj, tz_name), reply_markup=dead_card_keyboard(obj.id, obj.is_hidden),
-            parse_mode=ParseMode.HTML,
-        )
+    # Continue monitoring
+    if data.startswith("continue:"):
+        uid = data.split(":")[1]
+        link = await db.get_link_by_uid(uid)
+        if not link or link["chat_id"] != user.id:
+            await query.answer("Link not found.", show_alert=True)
+            return
+        await db.update_link_status(link["id"], "ACTIVE", die_alert_sent=0)
+        link = await db.get_link_by_uid(uid)
+        record = await db.get_user(user.id)
+        tz_name = record.get("timezone", "Asia/Dhaka") if record else "Asia/Dhaka"
+        text = active_card(link, tz_name)
+        kb = active_card_buttons(uid)
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest:
+            pass
+        await query.answer("🔄 Monitoring resumed!", show_alert=False)
         return
 
-    if action == "continue":
-        await db.resume_object(obj.id)
-        obj = await db.get_object(obj.id)
-        await query.edit_message_text(
-            render_active_card(obj, tz_name), reply_markup=active_card_keyboard(obj.id),
-            parse_mode=ParseMode.HTML,
-        )
+    # Stop monitoring
+    if data.startswith("stop:"):
+        uid = data.split(":")[1]
+        link = await db.get_link_by_uid(uid)
+        if not link or link["chat_id"] != user.id:
+            await query.answer("Link not found.", show_alert=True)
+            return
+        await db.update_link_status(link["id"], "STOPPED")
+        link = await db.get_link_by_uid(uid)
+        record = await db.get_user(user.id)
+        tz_name = record.get("timezone", "Asia/Dhaka") if record else "Asia/Dhaka"
+        text = stopped_card(link, tz_name)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Resume", callback_data=f"continue:{uid}")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+        ])
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except BadRequest:
+            pass
+        await query.answer("🛑 Monitoring stopped.", show_alert=False)
         return
 
-    if action == "stop":
-        await db.stop_object(obj.id)
-        await query.edit_message_text(f"⏹️ Stopped monitoring #{obj.id}.", reply_markup=main_menu_keyboard())
+
+# Edit handler (inline text editing via user_data state)
+@require_approved
+async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = context.user_data.get("editing_uid")
+    if not uid:
+        return
+    text = (update.message.text or "").strip()
+    if text.lower() == "/cancel":
+        context.user_data.pop("editing_uid", None)
+        await update.message.reply_text("❌ Edit cancelled.")
         return
 
+    parts = text.split("|", 1)
+    name = parts[0].strip()[:120]
+    note = parts[1].strip()[:500] if len(parts) > 1 else ""
 
-# ---------------------------------------------------------------------------
-# Background monitoring worker
-# ---------------------------------------------------------------------------
-
-async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    active_objs = await db.list_active_objects()
-    if not active_objs:
+    link = await db.get_link_by_uid(uid)
+    if not link or link["chat_id"] != update.effective_user.id:
+        context.user_data.pop("editing_uid", None)
+        await update.message.reply_text("❌ Link not found.")
         return
 
-    async with aiohttp.ClientSession() as session:
-        for obj in active_objs:
-            try:
-                result = await graph_checker.check_object(session, obj.object_id)
-            except Exception:
-                logger.exception("Unhandled error checking object %s", obj.id)
-                continue
-
-            if result.is_auth_error:
-                logger.warning("Auth error checking object %s: %s", obj.id, result.detail)
-                continue
-
-            if result.status == graph_checker.STATUS_UNKNOWN:
-                await db.touch_last_checked(obj.id)
-                continue
-
-            if result.status == graph_checker.STATUS_ACTIVE:
-                if result.name and result.name != obj.name:
-                    await db.update_object_status(obj.id, "ACTIVE", name=result.name)
-                else:
-                    await db.touch_last_checked(obj.id)
-                continue
-
-            await db.update_object_status(obj.id, "DEAD", name=result.name or obj.name)
-            if not obj.die_alert_sent:
-                await db.set_die_alert_sent(obj.id, True)
-                fresh = await db.get_object(obj.id)
-                user = await db.get_user(obj.chat_id)
-                tz_name = user.timezone if user else config.DEFAULT_TIMEZONE
-                try:
-                    await context.bot.send_message(
-                        obj.chat_id,
-                        render_dead_card(fresh, tz_name),
-                        reply_markup=dead_card_keyboard(fresh.id, fresh.is_hidden),
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
-                except Exception:
-                    logger.exception("Failed to send DIE alert for object %s", obj.id)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-async def main() -> None:
-    await db.init_db()
-
-    application = Application.builder().token(config.BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("block", cmd_block))
-    application.add_handler(CommandHandler("unblock", cmd_unblock))
-    application.add_handler(CommandHandler("users", cmd_users))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    application.job_queue.run_repeating(
-        monitor_job, interval=config.CHECK_INTERVAL_SECONDS, first=10
+    await db.update_link_meta(link["id"], name, note)
+    context.user_data.pop("editing_uid", None)
+    link = await db.get_link_by_uid(uid)
+    record = await db.get_user(update.effective_user.id)
+    tz_name = record.get("timezone", "Asia/Dhaka") if record else "Asia/Dhaka"
+    text_card = active_card(link, tz_name) if link["status"] == "ACTIVE" else dead_card(link, tz_name)
+    kb = active_card_buttons(uid) if link["status"] == "ACTIVE" else dead_card_buttons(uid, bool(link["is_hidden"]))
+    await update.message.reply_text(
+        f"✅ Updated!\n\n{text_card}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
     )
 
-    logger.info("Bot starting (check interval: %ss)", config.CHECK_INTERVAL_SECONDS)
 
-    async with application:
-        await application.start()
-        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        
-        # Keep running until killed
-        stop_signal = asyncio.Event()
-        await stop_signal.wait()
+# Background scanner (runs every CHECK_INTERVAL seconds)
+async def background_scanner(app: Application) -> None:
+    """Continuously scan all active links and fire die alerts."""
+    logger.info("Background scanner started (interval=%ds)", CHECK_INTERVAL)
+    await asyncio.sleep(10)  # Warm-up delay
+    while True:
+        try:
+            active_links = await db.get_all_active_links()
+            logger.info("Scanner: checking %d active link(s)", len(active_links))
+            for link in active_links:
+                try:
+                    result = await check_facebook_link(link["url"])
+                    if result.status == "DEAD":
+                        # Mark as DEAD and send alert (if not already sent)
+                        await db.update_link_status(link["id"], "DEAD", die_alert_sent=1)
+                        refreshed = await db.get_link_by_uid(link["uid"])
+                        if refreshed and not link.get("die_alert_sent"):
+                            await _send_die_alert(app, refreshed)
+                    elif result.status == "ACTIVE":
+                        # Still alive — just update last_checked
+                        await db.update_link_last_checked(link["id"])
+                    # ERROR — anti-glitch: do nothing (link stays ACTIVE)
+                except Exception as exc:
+                    logger.exception("Scanner error for link %s: %s", link.get("uid"), exc)
+                # Small delay between checks to avoid hammering
+                await asyncio.sleep(2)
+        except Exception as exc:
+            logger.exception("Scanner loop error: %s", exc)
+        await asyncio.sleep(CHECK_INTERVAL)
 
 
-if __name__ == '__main__':
+async def _send_die_alert(app: Application, link: Dict) -> None:
+    """Send a die-alert message to the link's owner."""
+    chat_id = link["chat_id"]
     try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+        record = await db.get_user(chat_id)
+        tz_name = record.get("timezone", "Asia/Dhaka") if record else "Asia/Dhaka"
+        text = (
+            f"🚨 **LINK DIED!**\n\n"
+            + dead_card(link, tz_name, spoiler=bool(link.get("is_hidden", False)))
+        )
+        kb = dead_card_buttons(link["uid"], bool(link.get("is_hidden", False)))
+        await app.bot.send_message(
+            chat_id,
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+        logger.info("Die alert sent for UID=%s to chat_id=%s", link["uid"], chat_id)
+    except TelegramError as exc:
+        logger.error("Failed to send die alert for UID=%s: %s", link.get("uid"), exc)
+
+
+# Post-init: register commands, start scanner
+async def post_init(app: Application) -> None:
+    await db.init_db()
+    commands = [
+        BotCommand("start",    "Main menu"),
+        BotCommand("list",     "List your monitored links"),
+        BotCommand("status",   "Check a link by UID"),
+        BotCommand("delete",   "Remove a link by UID"),
+        BotCommand("settings", "Change timezone"),
+        BotCommand("help",     "Show help"),
+    ]
+    await app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+    # Launch background scanner as a non-blocking task
+    asyncio.create_task(background_scanner(app))
+    logger.info("Bot initialised successfully.")
+
+
+# Main entry point
+def main() -> None:
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .concurrent_updates(True)
+        .build()
+    )
+
+    # Command handlers
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("list",     cmd_list))
+    app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("delete",   cmd_delete))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler("admin",    cmd_admin))
+    app.add_handler(CommandHandler("block",    cmd_block))
+    app.add_handler(CommandHandler("unblock",  cmd_unblock))
+    app.add_handler(CommandHandler("users",    cmd_users))
+
+    # Callback handler
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # URL message handler
+    url_filter = filters.TEXT & filters.Regex(r"facebook\.com")
+    app.add_handler(MessageHandler(url_filter, handle_url_message))
+
+    # Edit input handler (name|note via text)
+    edit_filter = filters.TEXT & ~filters.COMMAND & ~filters.Regex(r"facebook\.com")
+    app.add_handler(MessageHandler(edit_filter, handle_edit_input))
+
+    logger.info("Starting bot polling...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()

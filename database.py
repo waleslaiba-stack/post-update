@@ -1,276 +1,318 @@
 """
-Async SQLite persistence layer.
-
-Two tables:
-  users   - Telegram users and their approval status / timezone preference
-  objects - Facebook Graph API objects being monitored (posts, pages, etc.)
+database.py — Async SQLite CRUD layer via aiosqlite
 """
-import time
-from dataclasses import dataclass
-from typing import Optional
 
+from __future__ import annotations
+
+import os
+import asyncio
 import aiosqlite
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
-import config
+DB_PATH = os.getenv("DB_PATH", "./data/fb_monitor.db")
 
-_SCHEMA = """
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+CREATE_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     user_id     INTEGER PRIMARY KEY,
-    first_name  TEXT,
-    username    TEXT,
-    status      TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING / APPROVED / REJECTED / BLOCKED
-    timezone    TEXT NOT NULL DEFAULT 'Asia/Dhaka',
-    created_at  INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS objects (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id         INTEGER NOT NULL,
-    object_id       TEXT NOT NULL,     -- the Graph API object id we query
-    url             TEXT,              -- original url/input the user gave us
-    name            TEXT,
-    note            TEXT,
-    status          TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE / DEAD / STOPPED
-    is_hidden       INTEGER NOT NULL DEFAULT 0,
-    die_alert_sent  INTEGER NOT NULL DEFAULT 0,
-    created_at      INTEGER NOT NULL,
-    updated_at      INTEGER NOT NULL,
-    last_checked    INTEGER
+    first_name  TEXT    NOT NULL DEFAULT '',
+    username    TEXT    DEFAULT NULL,
+    status      TEXT    NOT NULL DEFAULT 'PENDING',  -- PENDING | APPROVED | REJECTED | BLOCKED
+    timezone    TEXT    NOT NULL DEFAULT 'Asia/Dhaka',
+    created_at  TEXT    NOT NULL
 );
 """
 
+CREATE_LINKS_SQL = """
+CREATE TABLE IF NOT EXISTS links (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id         INTEGER NOT NULL,
+    uid             TEXT    NOT NULL,
+    url             TEXT    NOT NULL,
+    name            TEXT    NOT NULL DEFAULT '',
+    note            TEXT    NOT NULL DEFAULT '',
+    status          TEXT    NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | DEAD | STOPPED
+    is_hidden       INTEGER NOT NULL DEFAULT 0,
+    die_alert_sent  INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL,
+    last_checked    TEXT    DEFAULT NULL
+);
+"""
 
-@dataclass
-class TrackedObject:
-    id: int
-    chat_id: int
-    object_id: str
-    url: Optional[str]
-    name: Optional[str]
-    note: Optional[str]
-    status: str
-    is_hidden: bool
-    die_alert_sent: bool
-    created_at: int
-    updated_at: int
-    last_checked: Optional[int]
-
-    @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> "TrackedObject":
-        return cls(
-            id=row["id"],
-            chat_id=row["chat_id"],
-            object_id=row["object_id"],
-            url=row["url"],
-            name=row["name"],
-            note=row["note"],
-            status=row["status"],
-            is_hidden=bool(row["is_hidden"]),
-            die_alert_sent=bool(row["die_alert_sent"]),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            last_checked=row["last_checked"],
-        )
+CREATE_IDX_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_links_chat_id ON links(chat_id)",
+    "CREATE INDEX IF NOT EXISTS idx_links_status  ON links(status)",
+    "CREATE INDEX IF NOT EXISTS idx_links_uid     ON links(uid)",
+]
 
 
-@dataclass
-class TrackedUser:
-    user_id: int
-    first_name: Optional[str]
-    username: Optional[str]
-    status: str
-    timezone: str
-    created_at: int
+# ---------------------------------------------------------------------------
+# Connection helper
+# ---------------------------------------------------------------------------
 
-    @classmethod
-    def from_row(cls, row: aiosqlite.Row) -> "TrackedUser":
-        return cls(
-            user_id=row["user_id"],
-            first_name=row["first_name"],
-            username=row["username"],
-            status=row["status"],
-            timezone=row["timezone"],
-            created_at=row["created_at"],
-        )
+async def get_db() -> aiosqlite.Connection:
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    conn = await aiosqlite.connect(DB_PATH)
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 
 async def init_db() -> None:
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        await db.executescript(_SCHEMA)
+    """Create tables and indexes if they don't exist."""
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute(CREATE_USERS_SQL)
+        await db.execute(CREATE_LINKS_SQL)
+        for idx_sql in CREATE_IDX_SQL:
+            await db.execute(idx_sql)
         await db.commit()
 
 
-def _now() -> int:
-    return int(time.time())
+def _now() -> str:
+    return datetime.utcnow().isoformat(sep=" ", timespec="seconds")
 
 
 # ---------------------------------------------------------------------------
-# Users
+# User operations
 # ---------------------------------------------------------------------------
 
-async def get_or_create_user(user_id: int, first_name: str, username: Optional[str]) -> TrackedUser:
-    async with aiosqlite.connect(config.DB_PATH) as db:
+async def upsert_user(user_id: int, first_name: str, username: Optional[str]) -> Dict[str, Any]:
+    """Insert or ignore user record. Returns the row."""
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
-            row = await cur.fetchone()
-        if row:
-            return TrackedUser.from_row(row)
-
-        status = "APPROVED" if user_id == config.ADMIN_ID else "PENDING"
+        now = _now()
         await db.execute(
-            "INSERT INTO users (user_id, first_name, username, status, timezone, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, first_name, username, status, config.DEFAULT_TIMEZONE, _now()),
+            """
+            INSERT INTO users (user_id, first_name, username, status, created_at)
+            VALUES (?, ?, ?, 'PENDING', ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                first_name = excluded.first_name,
+                username   = excluded.username
+            """,
+            (user_id, first_name, username, now),
         )
         await db.commit()
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
-        return TrackedUser.from_row(row)
+            return dict(row) if row else {}
 
 
-async def get_user(user_id: int) -> Optional[TrackedUser]:
-    async with aiosqlite.connect(config.DB_PATH) as db:
+async def get_user(user_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
-        return TrackedUser.from_row(row) if row else None
+            return dict(row) if row else None
 
 
 async def set_user_status(user_id: int, status: str) -> None:
-    async with aiosqlite.connect(config.DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET status = ? WHERE user_id = ?", (status, user_id))
         await db.commit()
 
 
 async def set_user_timezone(user_id: int, timezone: str) -> None:
-    async with aiosqlite.connect(config.DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET timezone = ? WHERE user_id = ?", (timezone, user_id))
         await db.commit()
 
 
-async def list_pending_users() -> list[TrackedUser]:
-    async with aiosqlite.connect(config.DB_PATH) as db:
+async def get_all_users(page: int = 1, per_page: int = 10) -> tuple[List[Dict], int]:
+    offset = (page - 1) * per_page
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE status = 'PENDING' ORDER BY created_at") as cur:
-            rows = await cur.fetchall()
-        return [TrackedUser.from_row(r) for r in rows]
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            total = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT * FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (per_page, offset),
+        ) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+        return rows, total
 
 
-async def list_all_users() -> list[TrackedUser]:
-    async with aiosqlite.connect(config.DB_PATH) as db:
+async def get_approved_users() -> List[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users ORDER BY created_at") as cur:
-            rows = await cur.fetchall()
-        return [TrackedUser.from_row(r) for r in rows]
+        async with db.execute("SELECT * FROM users WHERE status = 'APPROVED'") as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------
-# Objects (monitored Facebook items)
+# Link operations
 # ---------------------------------------------------------------------------
 
-async def add_object(chat_id: int, object_id: str, url: str, name: str, note: Optional[str],
-                      status: str = "ACTIVE") -> TrackedObject:
+def _gen_uid() -> str:
+    import random, string
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+
+async def create_link(
+    chat_id: int,
+    url: str,
+    name: str = "",
+    note: str = "",
+    status: str = "ACTIVE",
+) -> Dict[str, Any]:
     now = _now()
-    async with aiosqlite.connect(config.DB_PATH) as db:
+    uid = _gen_uid()
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "INSERT INTO objects (chat_id, object_id, url, name, note, status, is_hidden, "
-            "die_alert_sent, created_at, updated_at, last_checked) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)",
-            (chat_id, object_id, url, name, note, status, now, now, now),
+        while True:
+            async with db.execute("SELECT id FROM links WHERE uid = ?", (uid,)) as cur:
+                if not await cur.fetchone():
+                    break
+            uid = _gen_uid()
+
+        await db.execute(
+            """
+            INSERT INTO links (chat_id, uid, url, name, note, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (chat_id, uid, url, name, note, status, now, now),
         )
         await db.commit()
-        new_id = cur.lastrowid
-        async with db.execute("SELECT * FROM objects WHERE id = ?", (new_id,)) as c2:
-            row = await c2.fetchone()
-        return TrackedObject.from_row(row)
-
-
-async def get_object(obj_id: int) -> Optional[TrackedObject]:
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM objects WHERE id = ?", (obj_id,)) as cur:
+        async with db.execute("SELECT * FROM links WHERE uid = ?", (uid,)) as cur:
             row = await cur.fetchone()
-        return TrackedObject.from_row(row) if row else None
+            return dict(row) if row else {}
 
 
-async def list_objects_by_chat(chat_id: int) -> list[TrackedObject]:
-    async with aiosqlite.connect(config.DB_PATH) as db:
+async def get_link_by_id(link_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM links WHERE id = ?", (link_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_link_by_uid(uid: str) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM links WHERE uid = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_links_for_user(
+    chat_id: int,
+    status_filter: Optional[str] = None,
+    page: int = 1,
+    per_page: int = 5,
+) -> tuple[List[Dict], int]:
+    offset = (page - 1) * per_page
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if status_filter:
+            count_q = "SELECT COUNT(*) FROM links WHERE chat_id = ? AND status = ?"
+            fetch_q = "SELECT * FROM links WHERE chat_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            async with db.execute(count_q, (chat_id, status_filter)) as cur:
+                total = (await cur.fetchone())[0]
+            async with db.execute(fetch_q, (chat_id, status_filter, per_page, offset)) as cur:
+                rows = [dict(r) for r in await cur.fetchall()]
+        else:
+            count_q = "SELECT COUNT(*) FROM links WHERE chat_id = ?"
+            fetch_q = "SELECT * FROM links WHERE chat_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            async with db.execute(count_q, (chat_id,)) as cur:
+                total = (await cur.fetchone())[0]
+            async with db.execute(fetch_q, (chat_id, per_page, offset)) as cur:
+                rows = [dict(r) for r in await cur.fetchall()]
+        return rows, total
+
+
+async def get_all_active_links() -> List[Dict[str, Any]]:
+    """Used by the background scanner."""
+    async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM objects WHERE chat_id = ? ORDER BY created_at DESC", (chat_id,)
+            "SELECT * FROM links WHERE status = 'ACTIVE' ORDER BY last_checked ASC NULLS FIRST"
         ) as cur:
-            rows = await cur.fetchall()
-        return [TrackedObject.from_row(r) for r in rows]
+            return [dict(r) for r in await cur.fetchall()]
 
 
-async def list_active_objects() -> list[TrackedObject]:
-    """All objects currently ACTIVE, across all chats - used by the background worker."""
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM objects WHERE status = 'ACTIVE'") as cur:
-            rows = await cur.fetchall()
-        return [TrackedObject.from_row(r) for r in rows]
-
-
-async def update_object_status(obj_id: int, status: str, name: Optional[str] = None) -> None:
+async def update_link_status(
+    link_id: int,
+    status: str,
+    die_alert_sent: Optional[int] = None,
+) -> None:
     now = _now()
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        if name is not None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        if die_alert_sent is not None:
             await db.execute(
-                "UPDATE objects SET status = ?, name = ?, updated_at = ?, last_checked = ? WHERE id = ?",
-                (status, name, now, now, obj_id),
+                "UPDATE links SET status = ?, die_alert_sent = ?, updated_at = ?, last_checked = ? WHERE id = ?",
+                (status, die_alert_sent, now, now, link_id),
             )
         else:
             await db.execute(
-                "UPDATE objects SET status = ?, updated_at = ?, last_checked = ? WHERE id = ?",
-                (status, now, now, obj_id),
+                "UPDATE links SET status = ?, updated_at = ?, last_checked = ? WHERE id = ?",
+                (status, now, now, link_id),
             )
         await db.commit()
 
 
-async def touch_last_checked(obj_id: int) -> None:
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        await db.execute("UPDATE objects SET last_checked = ? WHERE id = ?", (_now(), obj_id))
-        await db.commit()
-
-
-async def set_object_hidden(obj_id: int, hidden: bool) -> None:
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        await db.execute("UPDATE objects SET is_hidden = ? WHERE id = ?", (int(hidden), obj_id))
-        await db.commit()
-
-
-async def set_die_alert_sent(obj_id: int, sent: bool) -> None:
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        await db.execute("UPDATE objects SET die_alert_sent = ? WHERE id = ?", (int(sent), obj_id))
-        await db.commit()
-
-
-async def set_note(obj_id: int, note: str) -> None:
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        await db.execute(
-            "UPDATE objects SET note = ?, updated_at = ? WHERE id = ?", (note, _now(), obj_id)
-        )
-        await db.commit()
-
-
-async def stop_object(obj_id: int) -> None:
-    await update_object_status(obj_id, "STOPPED")
-
-
-async def resume_object(obj_id: int) -> None:
-    """Continue monitoring: back to ACTIVE, alert flag reset."""
+async def update_link_last_checked(link_id: int) -> None:
     now = _now()
-    async with aiosqlite.connect(config.DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE objects SET status = 'ACTIVE', die_alert_sent = 0, updated_at = ? WHERE id = ?",
-            (now, obj_id),
+            "UPDATE links SET last_checked = ? WHERE id = ?",
+            (now, link_id),
         )
         await db.commit()
 
 
-async def delete_object(obj_id: int) -> None:
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        await db.execute("DELETE FROM objects WHERE id = ?", (obj_id,))
+async def update_link_meta(link_id: int, name: str, note: str) -> None:
+    now = _now()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE links SET name = ?, note = ?, updated_at = ? WHERE id = ?",
+            (name, note, now, link_id),
+        )
         await db.commit()
+
+
+async def set_link_hidden(link_id: int, is_hidden: bool) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE links SET is_hidden = ? WHERE id = ?",
+            (1 if is_hidden else 0, link_id),
+        )
+        await db.commit()
+
+
+async def delete_link(link_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM links WHERE id = ?", (link_id,))
+        await db.commit()
+
+
+async def get_link_stats(chat_id: int) -> Dict[str, int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status='ACTIVE'  THEN 1 ELSE 0 END) as active,
+                SUM(CASE WHEN status='DEAD'    THEN 1 ELSE 0 END) as dead,
+                SUM(CASE WHEN status='STOPPED' THEN 1 ELSE 0 END) as stopped,
+                COUNT(*) as total
+            FROM links WHERE chat_id = ?
+            """,
+            (chat_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            if row:
+                return {
+                    "active":  row["active"]  or 0,
+                    "dead":    row["dead"]    or 0,
+                    "stopped": row["stopped"] or 0,
+                    "total":   row["total"]   or 0,
+                }
+            return {"active": 0, "dead": 0, "stopped": 0, "total": 0}
